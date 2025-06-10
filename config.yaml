@@ -1,0 +1,133 @@
+# 实时聊天系统配置文件
+
+# 日志配置
+log:
+  level: 1                    # 日志级别 (0=Debug, 1=Info, 2=Warn, 3=Error)
+  output: "console"           # 输出方式 (console/file)
+  timeFormat: "2006-01-02 15:04:05"
+
+# 连接服务器配置
+server:
+  addr: ":8080"              # 服务器监听地址
+  readTimeout: "30s"         # 读取超时
+  writeTimeout: "30s"        # 写入超时
+  
+  # Redis配置
+  redis:
+    addr: "localhost:6379"   # Redis地址
+    password: ""             # Redis密码
+    db: 0                    # Redis数据库
+
+  # MySQL配置
+  mysql:
+    dsn: "user:password@tcp(localhost:3306)/livechat?charset=utf8mb4&parseTime=True&loc=Local"
+    maxOpenConns: 10         # 最大打开连接数
+    maxIdleConns: 5          # 最大空闲连接数
+    connMaxLifetime: "1h"    # 连接最大生存时间
+
+  # 时间轮配置
+  timeWheel:
+    timeTick: "100ms"        # 时间精度
+    slotNum: 1024            # 槽位数量
+
+  # 消息重试配置
+  messageRetry:
+    retryTime: "3s"          # 重试间隔
+    retryNum: 3              # 重试次数
+    delTime: "1h"            # 消息删除时间
+
+# 路由服务器配置
+router:
+  addr: ":8081"              # 路由服务器监听地址
+  
+  # Redis配置
+  redis:
+    addr: "localhost:6379"   # Redis地址
+    password: ""             # Redis密码
+    db: 0                    # Redis数据库
+
+  # MySQL配置
+  mysql:
+    dsn: "user:password@tcp(localhost:3306)/livechat?charset=utf8mb4&parseTime=True&loc=Local"
+    maxOpenConns: 10         # 最大打开连接数
+    maxIdleConns: 5          # 最大空闲连接数
+    connMaxLifetime: "1h"    # 连接最大生存时间
+
+  # Kafka配置
+  kafka:
+    addr: "localhost:9092"   # Kafka地址
+    topic: "livechat_messages" # 消息主题
+    groupId: "router_group"  # 消费者组ID
+
+  # 负载检查配置
+  loadCheck:
+    interval: "30s"          # 检查间隔
+    nodeTimeout: "60s"       # 节点超时时间
+
+  # 时间轮配置
+  timeWheel:
+    timeTick: "100ms"        # 时间精度
+    slotNum: 1024            # 槽位数量
+
+  # 消息重试配置
+  messageRetry:
+    retryTime: "3s"          # 重试间隔
+    retryNum: 3              # 重试次数
+    delTime: "1h"            # 消息删除时间
+
+# 消息中心配置
+messageCenter:
+  # Kafka配置
+  kafka:
+    addr: "localhost:9092"   # Kafka地址
+    topic: "livechat_messages" # 消息主题
+    groupId: "msgcenter_group" # 消费者组ID
+
+  # MySQL配置
+  mysql:
+    dsn: "user:password@tcp(localhost:3306)/livechat?charset=utf8mb4&parseTime=True&loc=Local"
+    maxOpenConns: 20         # 最大打开连接数
+    maxIdleConns: 10         # 最大空闲连接数
+    connMaxLifetime: "1h"    # 连接最大生存时间
+
+  # Redis配置
+  redis:
+    addr: "localhost:6379"   # Redis地址
+    password: ""             # Redis密码
+    db: 0                    # Redis数据库
+
+  batchSize: 100             # 批处理大小
+  flushInterval: "5s"        # 刷新间隔
+  workerCount: 4             # 工作协程数
+  retryTimes: 3              # 重试次数
+  messageTTL: "168h"         # 消息保留时间（7天）
+
+# 客户端配置
+client:
+  serverAddrs:               # 服务器地址列表（支持多个连接节点）
+    - "ws://localhost:8080"
+    - "ws://localhost:8082"  # 备用连接节点
+  connectTimeout: "10s"      # 连接超时
+  reconnectInterval: "5s"    # 重连间隔
+  messageTimeout: "10s"      # 消息超时
+  maxRetries: 3              # 最大重试次数
+  heartbeatInterval: "30s"   # 心跳间隔
+  bufferSize: 1000           # 消息缓冲区大小
+  fetchTimeout: "5s"         # 拉取超时
+  fetchBatchSize: 50         # 拉取批大小
+  fetchMaxRetries: 3         # 拉取最大重试次数
+
+# 工具库配置
+utils:
+  # 队列配置
+  queue:
+    filePath: "/tmp/queue"   # 队列文件路径
+    segmentSize: 1024        # 段大小
+    monitor: false           # 是否启用监控
+    latencySize: 100         # 延迟统计大小
+
+  # 池配置
+  pool:
+    filePath: "/tmp/pool"    # 池文件路径
+    groupSize: 4             # 组大小
+    minBufferSize: 1024      # 最小缓冲区大小
