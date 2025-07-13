@@ -1,0 +1,274 @@
+// message/message.proto
+syntax = "proto3";
+
+package message;
+
+option go_package = "liveChatroom/message";
+
+// 消息信封 - 所有消息的公共字段
+message MessageEnvelope {
+  uint64 connection_seq_id = 1;  // 连接序列号
+  bytes message_id = 2;          // 128位全局消息ID (16字节，时间戳[48bit]+用户ID[32bit]+房间号[32bit]+登录ID[4bit,支持多端登录]+序号[6bit]+自定义[6bit])
+  
+  oneof message {
+    // 房间管理
+    AllocateRoomId allocate_room_id = 10;           // 客户端请求分配房间号
+    AllocateRoomIdAck allocate_room_id_ack = 11;    // 分配房间号确认
+    CreateRoom create_room = 12;                     // 创建房间（配置房间参数）
+    CreateRoomAck create_room_ack = 13;             // 创建房间确认
+    JoinRoom join_room = 14;                         // 加入房间
+    JoinRoomAck join_room_ack = 15;                 // 加入房间确认
+    LeaveRoom leave_room = 16;                       // 离开房间
+    LeaveRoomAck leave_room_ack = 17;               // 离开房间确认
+    CloseRoom close_room = 18;                       // 关闭房间
+    CloseRoomAck close_room_ack = 19;               // 关闭房间确认
+    
+    // 聊天消息
+    ChatMessage chat_message = 20;
+    ChatMessageAck chat_message_ack = 21;
+    
+    // 消息查询
+    MessageFetchRequest message_fetch_request = 40;  // 查询特定消息（情况1和3）
+    MessageFetchResponse message_fetch_response = 41; // 查询特定消息响应
+    RoomMessageFetchRequest room_message_fetch_request = 42; // 拉取房间消息（情况2）
+    RoomMessageFetchResponse room_message_fetch_response = 43; // 拉取房间消息响应
+    
+    // 心跳
+    Heartbeat heartbeat = 50;
+    HeartbeatAck heartbeat_ack = 51;
+  }
+}
+
+// ==================== 房间管理 ====================
+
+// 客户端请求分配房间号
+message AllocateRoomId {
+  // 无字段，只需要请求分配房间号
+}
+
+// 分配房间号确认
+message AllocateRoomIdAck {
+  uint64 room_id = 1;        // 分配的房间ID
+  AllocateRoomIdStatus status = 2; // 状态
+  string reason = 3;          // 失败原因
+}
+
+enum AllocateRoomIdStatus {
+  ALLOCATE_ROOM_ID_SUCCESS = 0;
+  ALLOCATE_ROOM_ID_FAILED = 1;
+  ALLOCATE_ROOM_ID_SERVICE_UNAVAILABLE = 2;
+}
+
+// 创建房间（配置房间参数）
+message CreateRoom {
+  uint64 room_id = 1;        // 房间ID (使用分配到的房间号)
+  string name = 2;            // 房间名称
+  uint32 max_members = 3;    // 最大成员数
+  string password = 4;        // 房间密码 (可选)
+}
+
+// 创建房间确认
+message CreateRoomAck {
+  uint64 room_id = 1;        // 房间ID
+  CreateRoomStatus status = 2; // 状态
+  string reason = 3;          // 失败原因
+  repeated string router_addrs = 4; // 关联的路由节点地址列表
+}
+
+enum CreateRoomStatus {
+  CREATE_ROOM_SUCCESS = 0;
+  CREATE_ROOM_FAILED = 1;
+  CREATE_ROOM_ROOM_EXISTS = 2;
+  CREATE_ROOM_INVALID_PARAMS = 3;
+}
+
+// 加入房间
+message JoinRoom {
+  string password = 1;        // 房间密码 (如果房间设置了密码)
+}
+
+// 加入房间确认
+message JoinRoomAck {
+  uint64 room_id = 1;        // 房间ID
+  JoinRoomStatus status = 2;  // 状态
+  string reason = 3;          // 失败原因
+  RoomInfo room_info = 4;     // 房间信息
+  repeated string router_addrs = 5; // 关联的路由节点地址列表
+}
+
+enum JoinRoomStatus {
+  JOIN_ROOM_SUCCESS = 0;
+  JOIN_ROOM_FAILED = 1;
+  JOIN_ROOM_ROOM_NOT_FOUND = 2;
+  JOIN_ROOM_ROOM_FULL = 3;
+  JOIN_ROOM_WRONG_PASSWORD = 4;
+  JOIN_ROOM_ALREADY_IN_ROOM = 5;
+}
+
+// 离开房间
+message LeaveRoom {
+  // 无字段，房间ID从消息ID获取
+}
+
+// 离开房间确认
+message LeaveRoomAck {
+  uint64 room_id = 1;        // 房间ID
+  LeaveRoomStatus status = 2; // 状态
+  string reason = 3;          // 失败原因
+}
+
+enum LeaveRoomStatus {
+  LEAVE_ROOM_SUCCESS = 0;
+  LEAVE_ROOM_FAILED = 1;
+  LEAVE_ROOM_NOT_IN_ROOM = 2;
+}
+
+// 关闭房间
+message CloseRoom {
+  // 无字段，房间ID从消息ID获取
+}
+
+// 关闭房间确认
+message CloseRoomAck {
+  uint64 room_id = 1;        // 房间ID
+  CloseRoomStatus status = 2; // 状态
+  string reason = 3;          // 失败原因
+}
+
+enum CloseRoomStatus {
+  CLOSE_ROOM_SUCCESS = 0;
+  CLOSE_ROOM_FAILED = 1;
+  CLOSE_ROOM_NOT_OWNER = 2;
+  CLOSE_ROOM_ROOM_NOT_FOUND = 3;
+}
+
+// ==================== 聊天消息 ====================
+
+// 聊天消息
+message ChatMessage {
+  string content = 1;         // 消息内容
+  MessageType message_type = 2; // 消息类型
+  uint64 reply_to = 3;        // 回复的消息ID (可选)
+}
+
+// 聊天消息确认
+message ChatMessageAck {
+  uint64 room_id = 1;        // 房间ID (用于确认消息)
+  ChatMessageStatus status = 2; // 状态
+  string reason = 3;          // 失败原因
+}
+
+enum ChatMessageStatus {
+  CHAT_MESSAGE_SUCCESS = 0;
+  CHAT_MESSAGE_FAILED = 1;
+  CHAT_MESSAGE_USER_NOT_IN_ROOM = 2;
+  CHAT_MESSAGE_ROOM_NOT_FOUND = 3;
+  CHAT_MESSAGE_ROOM_CLOSED = 4;
+  CHAT_MESSAGE_CONTENT_TOO_LONG = 5;
+}
+
+enum MessageType {
+  MESSAGE_TYPE_TEXT = 0;
+  MESSAGE_TYPE_IMAGE = 1;
+  MESSAGE_TYPE_FILE = 2;
+  MESSAGE_TYPE_VOICE = 3;
+  MESSAGE_TYPE_VIDEO = 4;
+}
+
+// ==================== 消息查询 ====================
+
+// 查询特定消息请求（情况1和3：不确定消息是否收到 + 特定拉取消息）
+message MessageFetchRequest {
+  bytes message_id = 1;       // 128位全局消息ID
+  uint64 timestamp = 2;       // 查询时间戳
+}
+
+// 查询特定消息响应
+message MessageFetchResponse {
+  bytes message_id = 1;       // 128位全局消息ID
+  bool exists = 2;            // 消息是否存在
+  MessageStatus status = 3;    // 消息状态
+  string reason = 4;          // 状态原因
+  uint64 processed_at = 5;    // 处理时间
+  MessageContent message_content = 6; // 消息内容（如果存在）
+}
+
+// 拉取房间消息请求（情况2：加入房间后拉取较近的消息）
+message RoomMessageFetchRequest {
+  uint64 room_id = 1;         // 房间ID
+  uint64 before_message_id = 2; // 在此消息ID之前的消息（可选，用于分页）
+  uint32 limit = 3;           // 返回消息数量限制
+  uint64 since_timestamp = 4; // 从此时间戳开始的消息（可选）
+}
+
+// 拉取房间消息响应
+message RoomMessageFetchResponse {
+  uint64 room_id = 1;         // 房间ID
+  repeated MessageContent messages = 2; // 消息列表
+  bool has_more = 3;          // 是否还有更多消息
+  uint64 next_before_id = 4;  // 下一页的before_message_id
+  RoomMessageFetchStatus status = 5; // 状态
+  string reason = 6;          // 失败原因
+}
+
+enum RoomMessageFetchStatus {
+  ROOM_MESSAGE_FETCH_SUCCESS = 0;
+  ROOM_MESSAGE_FETCH_FAILED = 1;
+  ROOM_MESSAGE_FETCH_ROOM_NOT_FOUND = 2;
+  ROOM_MESSAGE_FETCH_ACCESS_DENIED = 3;
+}
+
+// 消息内容
+message MessageContent {
+  bytes message_id = 1;       // 128位全局消息ID
+  uint64 room_id = 2;         // 房间ID
+  uint64 user_id = 3;         // 发送者用户ID
+  string content = 4;         // 消息内容
+  MessageType message_type = 5; // 消息类型
+  uint64 reply_to = 6;        // 回复的消息ID (可选)
+  uint64 timestamp = 7;       // 消息时间戳
+  MessageStatus status = 8;    // 消息状态
+}
+
+enum MessageStatus {
+  MESSAGE_STATUS_UNKNOWN = 0;
+  MESSAGE_STATUS_PENDING = 1;   // 待处理
+  MESSAGE_STATUS_PROCESSING = 2; // 处理中
+  MESSAGE_STATUS_SUCCESS = 3;    // 成功
+  MESSAGE_STATUS_FAILED = 4;     // 失败
+  MESSAGE_STATUS_TIMEOUT = 5;    // 超时
+}
+
+// ==================== 心跳 ====================
+
+// 心跳
+message Heartbeat {
+  uint64 timestamp = 1;       // 时间戳
+}
+
+// 心跳确认
+message HeartbeatAck {
+  uint64 timestamp = 1;       // 时间戳
+  uint64 server_time = 2;     // 服务器时间
+}
+
+// ==================== 通用数据结构 ====================
+
+// 房间信息
+message RoomInfo {
+  uint64 room_id = 1;         // 房间ID
+  string name = 2;            // 房间名称
+  uint64 creator_id = 3;      // 创建者用户ID
+  uint32 max_members = 4;     // 最大成员数
+  uint32 current_members = 5; // 当前成员数
+  uint64 created_at = 6;      // 创建时间
+  RoomStatus status = 7;      // 房间状态
+  repeated uint64 member_ids = 8; // 成员用户ID列表
+  string password = 9;        // 房间密码 (可选)
+}
+
+enum RoomStatus {
+  ROOM_STATUS_OPEN = 0;
+  ROOM_STATUS_CLOSED = 1;
+  ROOM_STATUS_FULL = 2;
+}
