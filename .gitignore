@@ -1,0 +1,15 @@
+# 编译产物
+bin/
+*.exe
+*.test
+*.out
+
+# 日志
+*.log
+
+# IDE
+.idea/
+*.swp
+
+# 系统文件
+.DS_Store
