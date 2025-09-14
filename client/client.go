@@ -48,8 +48,9 @@ type LiveChatClient struct {
 	wg     sync.WaitGroup
 
 	// 状态
-	connected int32 // 原子操作
-	started   int32 // 原子操作
+	connected   int32 // 原子操作
+	started     int32 // 原子操作
+	syncingRoom int32 // 原子操作，防止重复的房间同步
 
 	// 统计信息
 	stats *ClientStats
@@ -86,6 +87,10 @@ func (c *LiveChatClient) reconnectLoop() {
 				log.Printf("Attempting to reconnect...")
 				if err := c.connectToAvailableServer(); err == nil {
 					log.Printf("Reconnected successfully")
+
+					// 同步房间状态，补拉断线期间的消息
+					c.syncRoomAfterReconnect()
+
 					return // 重连成功，退出循环
 				}
 			} else {
@@ -364,6 +369,9 @@ func (c *LiveChatClient) switchToNextAvailableConnection() error {
 				c.eventHandler.OnConnectionSwitched(oldAddr, node.addr)
 			}
 
+			// 切换后同步房间状态，补拉断线期间的消息
+			c.syncRoomAfterReconnect()
+
 			log.Printf("Switched connection from %s to %s", oldAddr, node.addr)
 			return nil
 		}
@@ -562,4 +570,41 @@ func (c *LiveChatClient) GetCurrentServerAddr() string {
 // GetRoomID 获取当前房间ID
 func (c *LiveChatClient) GetRoomID() uint32 {
 	return c.roomID
+}
+
+// syncRoomAfterReconnect 重连/切换节点后同步房间状态
+// 断线期间的消息通过重新加入房间+拉取历史消息补回来
+func (c *LiveChatClient) syncRoomAfterReconnect() {
+	roomID := c.GetRoomID()
+	if roomID == 0 || atomic.LoadInt32(&c.connected) == 0 {
+		return // 不在房间中或未连接，无需同步
+	}
+
+	if !atomic.CompareAndSwapInt32(&c.syncingRoom, 0, 1) {
+		return // 已有同步在进行中
+	}
+
+	go func() {
+		defer atomic.StoreInt32(&c.syncingRoom, 0)
+
+		// 等连接稳定后再同步
+		time.Sleep(200 * time.Millisecond)
+
+		// 重新加入房间（新连接上服务器不保留之前的会话状态）
+		if err := c.JoinRoom(uint64(roomID), ""); err != nil {
+			log.Printf("Failed to rejoin room %d after reconnect: %v", roomID, err)
+			return
+		}
+
+		// 补拉断线期间的消息
+		batchSize := uint32(c.config.FetchBatchSize)
+		if batchSize == 0 {
+			batchSize = 50
+		}
+		if err := c.FetchRoomMessages(0, batchSize, 0); err != nil {
+			log.Printf("Failed to fetch room messages after reconnect: %v", err)
+		} else {
+			log.Printf("Room %d synced after reconnect", roomID)
+		}
+	}()
 }
