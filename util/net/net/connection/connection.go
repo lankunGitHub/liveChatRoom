@@ -1,6 +1,7 @@
 package connection
 
 import (
+	"errors"
 	"fmt"
 	"liveChatroom/util/net/base/buffer"
 	"liveChatroom/util/net/base/io"
@@ -10,6 +11,7 @@ import (
 	"math/rand"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -160,20 +162,33 @@ func (c *Connection) GetProtocolType() protocol.ProtocolType {
 
 // ==================== I/O操作 ====================
 
+// ErrNeedMoreData 需要更多数据（协议检测/解析还不完整）
+var ErrNeedMoreData = errors.New("need more data")
+
 // Read 读取数据 - 自动协议检测和解析
+// epoll使用边缘触发(ET)模式，必须循环读取直到EAGAIN，
+// 否则内核缓冲中剩余的数据不会再触发新事件，会一直滞留
 func (c *Connection) Read() error {
 	if c.IsClosed() {
 		return fmt.Errorf("connection closed")
 	}
 
-	// 读取数据到缓冲区
-	n, err := c.reader.ReadToBuffer(c.readBuffer)
-	if err != nil {
-		c.handleError(err)
-		return err
-	}
+	for {
+		// 读取数据到缓冲区
+		n, err := c.reader.ReadToBuffer(c.readBuffer)
+		if err != nil {
+			// 内核缓冲已读空，本次事件的数据全部处理完毕
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				return nil
+			}
+			c.handleError(err)
+			return err
+		}
 
-	if n > 0 {
+		if n == 0 {
+			return nil // 没有更多数据可读
+		}
+
 		c.updateActivity()
 
 		// 触发读取事件
@@ -183,10 +198,14 @@ func (c *Connection) Read() error {
 		}
 
 		// 处理协议数据
-		return c.processData()
+		if err := c.processData(); err != nil {
+			// 数据不完整（如握手进行到一半），等下一次读事件
+			if errors.Is(err, ErrNeedMoreData) {
+				continue
+			}
+			return err
+		}
 	}
-
-	return nil
 }
 
 // Write 写入数据
@@ -314,7 +333,7 @@ func (c *Connection) detectAndSetupProtocol() error {
 	// 获取数据进行协议检测
 	data, err := c.readBuffer.Peek(1024)
 	if err != nil || len(data) == 0 {
-		return fmt.Errorf("insufficient data for protocol detection")
+		return ErrNeedMoreData // 数据还不够，等更多数据到达后再检测
 	}
 
 	// 检测协议类型
