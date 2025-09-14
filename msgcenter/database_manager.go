@@ -76,7 +76,8 @@ func (dm *DatabaseManager) prepareStatements() error {
 	var err error
 
 	// 插入消息语句
-	insertSQL := `INSERT INTO messages (message_id, user_id, room_id, login_id, message_type, content, data, created_at) 
+	// INSERT IGNORE + message_id唯一索引：Kafka重复消费/重放时幂等，不产生重复数据
+	insertSQL := `INSERT IGNORE INTO messages (message_id, user_id, room_id, login_id, message_type, content, data, created_at)
 				  VALUES (?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(? / 1000))`
 	dm.insertMessageStmt, err = dm.db.Prepare(insertSQL)
 	if err != nil {

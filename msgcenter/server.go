@@ -29,6 +29,7 @@ type MessageCenterServer struct {
 	// 核心管理器
 	messageManager     *MessageManager
 	kafkaManager       *KafkaManager
+	kafkaConsumer      *KafkaConsumer
 	databaseManager    *DatabaseManager
 	queryManager       *QueryManager
 	reliabilityManager *CenterReliabilityManager
@@ -382,6 +383,9 @@ func (mcs *MessageCenterServer) initManagers() {
 	// Kafka管理器
 	mcs.kafkaManager = NewKafkaManager(mcs.config)
 
+	// Kafka消费者（消费消息并批量落库，与直写路径通过唯一索引幂等）
+	mcs.kafkaConsumer = NewKafkaConsumer(mcs.databaseManager, mcs.config)
+
 	// 消息管理器
 	mcs.messageManager = NewMessageManager(mcs, mcs.config)
 
@@ -411,6 +415,7 @@ func (mcs *MessageCenterServer) Start() error {
 	// 启动管理器
 	mcs.databaseManager.Start(mcs.ctx)
 	mcs.kafkaManager.Start(mcs.ctx)
+	mcs.kafkaConsumer.Start(mcs.ctx)
 	mcs.messageManager.Start(mcs.ctx)
 	mcs.queryManager.Start(mcs.ctx)
 
@@ -440,6 +445,11 @@ func (mcs *MessageCenterServer) Stop() error {
 	// 停止网络服务器
 	if mcs.server != nil {
 		mcs.server.Stop()
+	}
+
+	// 停止Kafka消费者
+	if mcs.kafkaConsumer != nil {
+		mcs.kafkaConsumer.Stop()
 	}
 
 	// 关闭数据库连接
