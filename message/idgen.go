@@ -10,7 +10,8 @@ import (
 // GlobalIDGenerator 128位全局消息ID生成器
 // ID格式: 时间戳[48bit] + 用户ID[32bit] + 房间号[32bit] + 登录ID[4bit] + 序号[6bit] + 自定义[6bit]
 type GlobalIDGenerator struct {
-	sequence uint64 // 序列号计数器
+	sequence      uint64 // 序列号计数器
+	lastTimestamp int64  // 上次生成的时间戳(毫秒)，用于时钟回拨检测
 }
 
 const (
@@ -48,18 +49,53 @@ func NewGlobalIDGenerator() *GlobalIDGenerator {
 }
 
 // GenerateGlobalID 生成128位全局消息ID
+// 处理两类边界情况：
+//  1. 时钟回拨：若当前时间小于上次生成时间，复用上次时间戳，靠序列号递增保证唯一
+//  2. 同毫秒序号耗尽：6位序号每毫秒最多64个，耗尽则自旋等待下一毫秒
 func (g *GlobalIDGenerator) GenerateGlobalID(userID, roomID uint32, loginID, custom uint8) GlobalID {
-	// 获取当前时间戳 (毫秒)
-	now := time.Now().UnixMilli()
-	timestamp := uint64(now - Epoch)
+	for {
+		now := time.Now().UnixMilli()
+		last := atomic.LoadInt64(&g.lastTimestamp)
 
+		if now < last {
+			// 时钟回拨，复用上次时间戳
+			now = last
+		}
+
+		// 抢占新的毫秒时间戳
+		if now > last {
+			if atomic.CompareAndSwapInt64(&g.lastTimestamp, last, now) {
+				return g.buildID(now, userID, roomID, loginID, custom)
+			}
+			// 其他协程已经更新了时间戳，重新循环
+			continue
+		}
+
+		// 同一毫秒内：序列号递增
+		seq := atomic.AddUint64(&g.sequence, 1) & MaxSequence
+		if seq == 0 {
+			// 序列号耗尽(64个/毫秒)，自旋等待下一毫秒
+			time.Sleep(200 * time.Microsecond)
+			continue
+		}
+
+		return g.buildIDWithSeq(now, userID, roomID, loginID, custom, seq)
+	}
+}
+
+// buildID 构建全局ID（新毫秒，序列号从头开始）
+func (g *GlobalIDGenerator) buildID(now int64, userID, roomID uint32, loginID, custom uint8) GlobalID {
+	seq := atomic.AddUint64(&g.sequence, 1) & MaxSequence
+	return g.buildIDWithSeq(now, userID, roomID, loginID, custom, seq)
+}
+
+// buildIDWithSeq 按给定时间戳和序列号构建全局ID
+func (g *GlobalIDGenerator) buildIDWithSeq(now int64, userID, roomID uint32, loginID, custom uint8, seq uint64) GlobalID {
 	// 确保时间戳不超过48位
+	timestamp := uint64(now - Epoch)
 	if timestamp > MaxTimestamp {
 		timestamp = MaxTimestamp
 	}
-
-	// 原子操作获取序列号
-	seq := atomic.AddUint64(&g.sequence, 1) & MaxSequence
 
 	var id GlobalID
 
