@@ -3,6 +3,7 @@ package connection
 import (
 	"errors"
 	"fmt"
+	strio "io"
 	"liveChatroom/util/net/base/buffer"
 	"liveChatroom/util/net/base/io"
 	"liveChatroom/util/net/base/socket"
@@ -95,8 +96,10 @@ func NewConnection(sock *socket.Socket, localAddr, remoteAddr string) *Connectio
 		writeStream: io.NewWriteStream(sock.FD(), 8192),
 
 		// 创建缓冲区
-		readBuffer:  buffer.Get(8192),
-		writeBuffer: buffer.Get(8192),
+		// 直接分配而非池取：池中的缓冲区上限只有 2×size(16KB)，
+		// 单条大消息（如4MB上限的消息）会撑爆缓冲区导致连接停滞
+		readBuffer:  buffer.NewRingBufferWithCapacity(8192, 4*1024*1024),
+		writeBuffer: buffer.NewRingBufferWithCapacity(8192, 1024*1024),
 
 		// 默认超时设置
 		readTimeout:  30 * time.Second,
@@ -181,12 +184,18 @@ func (c *Connection) Read() error {
 			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 				return nil
 			}
+			// 对端发送了FIN：主动关闭连接并触发onClose回调
+			if errors.Is(err, strio.EOF) {
+				c.handleError(err)
+				c.Close()
+				return nil
+			}
 			c.handleError(err)
 			return err
 		}
 
 		if n == 0 {
-			return nil // 没有更多数据可读
+			return nil // 缓冲区已满且无法扩容，等待消息被消费后再读
 		}
 
 		c.updateActivity()
@@ -649,6 +658,12 @@ func (c *Connection) OnClose(handler func(*Connection)) {
 // OnError 设置错误事件处理器
 func (c *Connection) OnError(handler func(*Connection, error)) {
 	c.onError = handler
+}
+
+// GetOnClose 获取当前关闭事件处理器
+// 供需要链式包装的调用方（如 Manager）在覆盖前保留旧回调
+func (c *Connection) GetOnClose() func(*Connection) {
+	return c.onClose
 }
 
 // OnMessage 设置消息事件处理器

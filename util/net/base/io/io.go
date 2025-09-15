@@ -1,6 +1,7 @@
 package io
 
 import (
+	strio "io"
 	"liveChatroom/util/net/base/buffer"
 	"syscall"
 	"unsafe"
@@ -65,6 +66,11 @@ func (r *Reader) ReadToBuffer(buf buffer.Buffer) (int, error) {
 		return written, nil
 	}
 
+	// 读到了0字节：缓冲区有空间但 read 返回 (0,nil) = 对端关闭（EOF）；
+	// 缓冲区无空间（扩容失败）则返回 (0,nil) 表示本次无进展
+	if len(tempBuf) > 0 {
+		return 0, strio.EOF
+	}
 	return 0, nil
 }
 

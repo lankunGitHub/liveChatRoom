@@ -70,19 +70,19 @@ func (m *Manager) Start() {
 // Stop 停止管理器
 func (m *Manager) Stop() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if !m.running {
+		m.mu.Unlock()
 		return
 	}
 
 	m.running = false
 	close(m.stopChan)
+	m.mu.Unlock()
 
-	// 等待清理协程结束
+	// 等待清理协程结束（cleanup需要m.mu，必须先释放）
 	m.wg.Wait()
 
-	// 关闭所有连接
+	// 关闭所有连接（内部自行加锁）
 	m.closeAllConnections()
 }
 
@@ -128,21 +128,21 @@ func (m *Manager) AddConnection(conn *Connection) error {
 // RemoveConnection 移除连接
 func (m *Manager) RemoveConnection(conn *Connection) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	id := conn.ID()
 	fd := conn.FD()
 
 	// 检查连接是否存在
 	if _, exists := m.connections[id]; !exists {
+		m.mu.Unlock()
 		return fmt.Errorf("connection not found: %s", id)
 	}
 
 	// 移除连接
 	delete(m.connections, id)
 	delete(m.connsByFD, fd)
+	m.mu.Unlock()
 
-	// 触发断开连接事件
+	// 触发断开连接事件（锁外回调，避免回调内再次进入管理器时死锁）
 	if m.onDisconnect != nil {
 		m.onDisconnect(conn)
 	}
@@ -226,20 +226,26 @@ func (m *Manager) BroadcastByProtocol(protocolType protocol.ProtocolType, msg pr
 
 // CloseAllConnections 关闭所有连接
 func (m *Manager) CloseAllConnections() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.closeAllConnections()
 }
 
-// closeAllConnections 内部关闭所有连接方法（不加锁）
+// closeAllConnections 关闭所有连接
+// 先持锁取出快照并清空映射，再在锁外逐个关闭：
+// conn.Close 会同步回调 onClose → RemoveConnection 再次加锁，
+// 若持有 m.mu 时关闭会自死锁
 func (m *Manager) closeAllConnections() {
+	m.mu.Lock()
+	conns := make([]*Connection, 0, len(m.connections))
 	for _, conn := range m.connections {
-		conn.Close()
+		conns = append(conns, conn)
 	}
-
-	// 清空映射
 	m.connections = make(map[string]*Connection)
 	m.connsByFD = make(map[int]*Connection)
+	m.mu.Unlock()
+
+	for _, conn := range conns {
+		conn.Close()
+	}
 }
 
 // ==================== 连接查找 ====================
@@ -296,7 +302,13 @@ func (m *Manager) OnError(handler func(*Connection, error)) {
 // setupConnectionHandlers 设置连接事件处理器
 func (m *Manager) setupConnectionHandlers(conn *Connection) {
 	// 设置关闭事件处理器 - 自动从管理器中移除
+	// 注意：Connection.OnClose 是单值字段，直接覆盖会丢失之前
+	// 注册的回调（如引擎层的关闭通知），因此这里做链式包装
+	prev := conn.GetOnClose()
 	conn.OnClose(func(c *Connection) {
+		if prev != nil {
+			prev(c)
+		}
 		m.RemoveConnection(c)
 	})
 
@@ -326,17 +338,19 @@ func (m *Manager) cleanupLoop() {
 }
 
 // cleanup 清理无效连接
+// 持锁只做检查与摘除，Close 放到锁外执行：
+// conn.Close 会同步回调 onClose → RemoveConnection 再次加锁，
+// 若持有 m.mu 时关闭会自死锁
 func (m *Manager) cleanup() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	now := time.Now()
-	var toRemove []string
+	var toClose []*Connection
 
+	m.mu.Lock()
 	for id, conn := range m.connections {
 		// 检查连接是否已关闭
 		if conn.IsClosed() {
-			toRemove = append(toRemove, id)
+			delete(m.connections, id)
+			delete(m.connsByFD, conn.FD())
 			continue
 		}
 
@@ -347,19 +361,17 @@ func (m *Manager) cleanup() {
 			conn.mu.RUnlock()
 
 			if now.Sub(lastActive) > m.idleTimeout {
-				toRemove = append(toRemove, id)
-				conn.Close()
+				delete(m.connections, id)
+				delete(m.connsByFD, conn.FD())
+				toClose = append(toClose, conn)
 			}
 		}
 	}
+	m.mu.Unlock()
 
-	// 移除无效连接
-	for _, id := range toRemove {
-		if conn, exists := m.connections[id]; exists {
-			fd := conn.FD()
-			delete(m.connections, id)
-			delete(m.connsByFD, fd)
-		}
+	// 锁外关闭（触发 onClose 回调链，其中 RemoveConnection 会再进锁）
+	for _, conn := range toClose {
+		conn.Close()
 	}
 }
 

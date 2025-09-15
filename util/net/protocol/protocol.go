@@ -401,23 +401,17 @@ func (d *SmartDetector) GetConfidence(data []byte, protocolType ProtocolType) fl
 }
 
 // calculateConfidence 计算置信度
+// 同一协议的多个模式是"互斥备选项"（如 HTTP 的各个方法动词，
+// 一条数据只会命中其中一个），因此命中任意一个即可判定该协议。
+// 若把所有备选项权重累加为分母，单个命中时置信度恒为 1/N，
+// 永远达不到 Detect 的 0.5 阈值导致检测失效。
 func (d *SmartDetector) calculateConfidence(data []byte, patterns []DetectionPattern) float64 {
-	totalWeight := 0.0
-	matchedWeight := 0.0
-
 	for _, pattern := range patterns {
-		totalWeight += pattern.Weight
-
 		if d.matchPattern(data, pattern) {
-			matchedWeight += pattern.Weight
+			return 1.0
 		}
 	}
-
-	if totalWeight == 0 {
-		return 0.0
-	}
-
-	return matchedWeight / totalWeight
+	return 0.0
 }
 
 // matchPattern 匹配模式

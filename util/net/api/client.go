@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"liveChatroom/util/net/base/epoll"
 	"liveChatroom/util/net/base/socket"
 	"liveChatroom/util/net/net/connection"
 	"liveChatroom/util/net/protocol"
@@ -163,6 +164,10 @@ func (c *Client) Connect(address string) error {
 	c.stats.ConnectTime = time.Now()
 	c.stats.LastActivity = time.Now()
 
+	// 启动读循环（客户端此前缺失读路径，OnMessageReceived 永远不触发）
+	c.wg.Add(1)
+	go c.readLoop(conn)
+
 	// 启动连接处理
 	c.wg.Add(1)
 	go c.handleConnection()
@@ -179,6 +184,61 @@ func (c *Client) Connect(address string) error {
 	return nil
 }
 
+// readLoop 客户端读循环
+// 用独立epoll等待socket可读，可读后交给conn.Read()排空——
+// 客户端socket是非阻塞的，不能直接轮询read（EAGAIN会导致100% CPU空转）
+func (c *Client) readLoop(conn *connection.Connection) {
+	defer c.wg.Done()
+
+	ep, err := epoll.New()
+	if err != nil {
+		c.eventHandler.OnError(c, fmt.Errorf("failed to create epoll for client read: %v", err))
+		return
+	}
+	defer ep.Close()
+
+	if err := ep.Add(conn.FD(), epoll.EPOLLIN|epoll.EPOLLET); err != nil {
+		c.eventHandler.OnError(c, fmt.Errorf("failed to register client fd to epoll: %v", err))
+		return
+	}
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		if atomic.LoadInt32(&c.connected) == 0 {
+			return // 已断开
+		}
+
+		// 等待可读事件（100ms超时，兼顾断开检测）
+		n, err := ep.Wait(100)
+		if err != nil {
+			if atomic.LoadInt32(&c.connected) == 0 {
+				return
+			}
+			continue
+		}
+
+		if n == 0 {
+			continue // 超时无事件
+		}
+
+		// 读排空（内部循环到EAGAIN），消息经OnMessage回调派发
+		if err := conn.Read(); err != nil {
+			if conn.IsClosed() || atomic.LoadInt32(&c.connected) == 0 {
+				return
+			}
+			// 读错误：标记断开，通知上层，由handleConnection处理重连
+			atomic.StoreInt32(&c.connected, 0)
+			c.eventHandler.OnError(c, err)
+			return
+		}
+	}
+}
+
 // Disconnect 断开连接
 func (c *Client) Disconnect() error {
 	if !atomic.CompareAndSwapInt32(&c.connected, 1, 0) {
@@ -188,16 +248,13 @@ func (c *Client) Disconnect() error {
 	// 取消上下文
 	c.cancel()
 
-	// 关闭连接
+	// 关闭连接（Close会触发onClose回调→OnDisconnected通知）
 	if c.conn != nil {
 		c.conn.Close()
 	}
 
 	// 等待协程结束
 	c.wg.Wait()
-
-	// 通知断开连接
-	c.eventHandler.OnDisconnected(c, nil)
 
 	return nil
 }

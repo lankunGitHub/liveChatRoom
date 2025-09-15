@@ -2,13 +2,15 @@ package socket
 
 import (
 	"net"
+	"strconv"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
 
 // Socket 高性能socket封装
 type Socket struct {
-	fd     int
+	fd     int64 // 原子访问（Close与并发IO竞争）
 	family int
 	sotype int
 }
@@ -21,7 +23,7 @@ func NewSocket(family, sotype, proto int) (*Socket, error) {
 	}
 
 	s := &Socket{
-		fd:     fd,
+		fd:     int64(fd),
 		family: family,
 		sotype: sotype,
 	}
@@ -48,7 +50,7 @@ func NewUDPSocket() (*Socket, error) {
 // FromFD 从文件描述符创建Socket
 func FromFD(fd int) *Socket {
 	return &Socket{
-		fd:     fd,
+		fd:     int64(fd),
 		family: syscall.AF_INET,
 		sotype: syscall.SOCK_STREAM,
 	}
@@ -58,29 +60,34 @@ func FromFD(fd int) *Socket {
 
 // FD 获取文件描述符
 func (s *Socket) FD() int {
-	return s.fd
+	return s.fdVal()
+}
+
+// fdVal 原子读取文件描述符
+func (s *Socket) fdVal() int {
+	return int(atomic.LoadInt64(&s.fd))
 }
 
 // Close 关闭socket
+// 用原子交换保证幂等，并与并发读fd的IO操作无数据竞争
 func (s *Socket) Close() error {
-	if s.fd < 0 {
+	fd := atomic.SwapInt64(&s.fd, -1)
+	if fd < 0 {
 		return nil
 	}
-	err := syscall.Close(s.fd)
-	s.fd = -1
-	return err
+	return syscall.Close(int(fd))
 }
 
 // ==================== 非阻塞I/O ====================
 
 // SetNonblock 设置非阻塞模式
 func (s *Socket) SetNonblock() error {
-	return setNonblock(s.fd)
+	return setNonblock(s.fdVal())
 }
 
 // Read 非阻塞读取
 func (s *Socket) Read(buf []byte) (int, error) {
-	n, err := syscall.Read(s.fd, buf)
+	n, err := syscall.Read(s.fdVal(), buf)
 	if err != nil {
 		return 0, err
 	}
@@ -89,7 +96,7 @@ func (s *Socket) Read(buf []byte) (int, error) {
 
 // Write 非阻塞写入
 func (s *Socket) Write(buf []byte) (int, error) {
-	n, err := syscall.Write(s.fd, buf)
+	n, err := syscall.Write(s.fdVal(), buf)
 	if err != nil {
 		return 0, err
 	}
@@ -99,7 +106,7 @@ func (s *Socket) Write(buf []byte) (int, error) {
 // Readv 向量读取（零拷贝）
 func (s *Socket) Readv(iovecs []syscall.Iovec) (int, error) {
 	n, _, errno := syscall.Syscall(syscall.SYS_READV,
-		uintptr(s.fd),
+		uintptr(s.fdVal()),
 		uintptr(unsafe.Pointer(&iovecs[0])),
 		uintptr(len(iovecs)))
 	if errno != 0 {
@@ -111,7 +118,7 @@ func (s *Socket) Readv(iovecs []syscall.Iovec) (int, error) {
 // Writev 向量写入（零拷贝）
 func (s *Socket) Writev(iovecs []syscall.Iovec) (int, error) {
 	n, _, errno := syscall.Syscall(syscall.SYS_WRITEV,
-		uintptr(s.fd),
+		uintptr(s.fdVal()),
 		uintptr(unsafe.Pointer(&iovecs[0])),
 		uintptr(len(iovecs)))
 	if errno != 0 {
@@ -129,17 +136,17 @@ func (s *Socket) Bind(addr string) error {
 		return err
 	}
 
-	return syscall.Bind(s.fd, sockAddr)
+	return syscall.Bind(s.fdVal(), sockAddr)
 }
 
 // Listen 开始监听
 func (s *Socket) Listen(backlog int) error {
-	return syscall.Listen(s.fd, backlog)
+	return syscall.Listen(s.fdVal(), backlog)
 }
 
 // Accept 接受连接
 func (s *Socket) Accept() (*Socket, string, error) {
-	fd, sockAddr, err := syscall.Accept(s.fd)
+	fd, sockAddr, err := syscall.Accept(s.fdVal())
 	if err != nil {
 		return nil, "", err
 	}
@@ -151,7 +158,7 @@ func (s *Socket) Accept() (*Socket, string, error) {
 	}
 
 	conn := &Socket{
-		fd:     fd,
+		fd:     int64(fd),
 		family: s.family,
 		sotype: s.sotype,
 	}
@@ -169,7 +176,7 @@ func (s *Socket) Connect(addr string) error {
 		return err
 	}
 
-	err = syscall.Connect(s.fd, sockAddr)
+	err = syscall.Connect(s.fdVal(), sockAddr)
 	if err != nil && err != syscall.EINPROGRESS {
 		return err
 	}
@@ -221,12 +228,12 @@ func (s *Socket) SetLinger(onoff bool, timeout int) error {
 
 // setSockoptInt 设置int类型socket选项
 func (s *Socket) setSockoptInt(level, opt, value int) error {
-	return syscall.SetsockoptInt(s.fd, level, opt, value)
+	return syscall.SetsockoptInt(s.fdVal(), level, opt, value)
 }
 
 // setSockoptLinger 设置Linger选项
 func (s *Socket) setSockoptLinger(level, opt int, linger *syscall.Linger) error {
-	return syscall.SetsockoptLinger(s.fd, level, opt, linger)
+	return syscall.SetsockoptLinger(s.fdVal(), level, opt, linger)
 }
 
 // ==================== 工具函数 ====================
@@ -277,10 +284,10 @@ func sockAddrToString(sockAddr syscall.Sockaddr) string {
 	switch addr := sockAddr.(type) {
 	case *syscall.SockaddrInet4:
 		ip := net.IPv4(addr.Addr[0], addr.Addr[1], addr.Addr[2], addr.Addr[3])
-		return net.JoinHostPort(ip.String(), string(rune(addr.Port)))
+		return net.JoinHostPort(ip.String(), strconv.Itoa(addr.Port))
 	case *syscall.SockaddrInet6:
 		ip := net.IP(addr.Addr[:])
-		return net.JoinHostPort(ip.String(), string(rune(addr.Port)))
+		return net.JoinHostPort(ip.String(), strconv.Itoa(addr.Port))
 	default:
 		return "unknown"
 	}

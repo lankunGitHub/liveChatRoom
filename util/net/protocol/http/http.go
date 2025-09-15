@@ -241,6 +241,11 @@ func (p *HTTPParser) Parse(buf buffer.Buffer) ([]protocol.Message, error) {
 		}
 
 		if consumed == 0 {
+			// 无新数据消费：若刚完成了一条消息且缓冲中还有数据
+			// （管道化请求），继续解析下一条
+			if msg != nil && len(p.buffer) > 0 {
+				continue
+			}
 			break // 需要更多数据
 		}
 
@@ -253,6 +258,15 @@ func (p *HTTPParser) Parse(buf buffer.Buffer) ([]protocol.Message, error) {
 
 // parseNext 解析下一个完整消息
 func (p *HTTPParser) parseNext() (protocol.Message, int, error) {
+	// stateComplete 必须优先于空缓冲检查处理：
+	// 消息体刚好读完时缓冲区可能已为空，
+	// 若先走"空缓冲直接返回"，已完成的消息会被静默丢弃
+	if p.state == stateComplete {
+		msg := p.completeMessage()
+		p.finishMessage()
+		return msg, 0, nil
+	}
+
 	if len(p.buffer) == 0 {
 		return nil, 0, nil
 	}
@@ -268,10 +282,6 @@ func (p *HTTPParser) parseNext() (protocol.Message, int, error) {
 		return p.parseBody()
 	case stateChunkedBody:
 		return p.parseChunkedBody()
-	case stateComplete:
-		msg := p.completeMessage()
-		p.Reset()
-		return msg, 0, nil
 	default:
 		return nil, 0, &protocol.ProtocolError{
 			Type:    protocol.ProtocolHTTP,
@@ -439,8 +449,12 @@ func (p *HTTPParser) parseHeaders() (protocol.Message, int, error) {
 // parseBody 解析固定长度body
 func (p *HTTPParser) parseBody() (protocol.Message, int, error) {
 	if p.contentLength == 0 {
+		// 正常情况下无body的消息在parseHeaders已直接置complete；
+		// 此分支防御性保留，直接完成消息避免卡在complete态等下一次Parse
 		p.state = stateComplete
-		return nil, 0, nil
+		msg := p.completeMessage()
+		p.finishMessage()
+		return msg, 0, nil
 	}
 
 	if len(p.buffer) < int(p.contentLength) {
@@ -645,8 +659,15 @@ func (p *HTTPParser) Reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.state = stateRequestLine
+	p.finishMessage()
 	p.buffer = p.buffer[:0]
+}
+
+// finishMessage 复位消息解析状态（保留缓冲中的剩余数据）
+// 供 Parse 内部在完成一条消息后转入下一条时调用，不持锁。
+// 注意：不能调用 Reset()——Parse 已持有 p.mu，再次加锁会死锁
+func (p *HTTPParser) finishMessage() {
+	p.state = stateRequestLine
 	p.headerComplete = false
 	p.bodyComplete = false
 	p.contentLength = 0

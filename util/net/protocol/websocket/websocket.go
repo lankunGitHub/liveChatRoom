@@ -212,7 +212,17 @@ func (p *WebSocketParser) parseFrame() (protocol.Message, int, error) {
 		if len(p.buffer) < 10 {
 			return nil, 0, nil
 		}
-		payloadLen = int64(binary.BigEndian.Uint64(p.buffer[2:10]))
+		rawLen := binary.BigEndian.Uint64(p.buffer[2:10])
+		// RFC 6455: 64位长度的最高位必须为0。
+		// 若最高位为1，转成int64后为负数，后续 make([]byte, 负数) 会直接 panic
+		if rawLen&(1<<63) != 0 {
+			return nil, 0, &protocol.ProtocolError{
+				Type:    protocol.ProtocolWebSocket,
+				Code:    protocol.ErrCodeInvalidFrameData,
+				Message: "invalid 64-bit payload length: MSB must be 0",
+			}
+		}
+		payloadLen = int64(rawLen)
 		headerLen = 10
 	}
 

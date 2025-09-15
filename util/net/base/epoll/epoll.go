@@ -1,6 +1,7 @@
 package epoll
 
 import (
+	"encoding/binary"
 	"syscall"
 	"unsafe"
 )
@@ -11,10 +12,18 @@ type Event struct {
 	Data   uint64 // 用户数据（通常存储fd）
 }
 
+// epollEventSize 内核 struct epoll_event 的大小
+// 注意：Linux 内核的 epoll_event 是 __attribute__((packed))，
+// 布局为 {u32 events; u64 data} 共 12 字节，data 偏移为 4。
+// Go 的 Event 结构体是 16 字节（uint64 按 8 字节对齐），
+// 不能直接传给内核，必须手动按 12 字节打包/解包。
+const epollEventSize = 12
+
 // Epoll epoll实例封装
 type Epoll struct {
-	fd     int
-	events []Event
+	fd        int
+	events    []Event
+	rawEvents []byte // 内核格式的原始事件缓冲区 (12字节/事件)
 }
 
 // 事件类型常量
@@ -42,8 +51,9 @@ func New() (*Epoll, error) {
 	}
 
 	return &Epoll{
-		fd:     fd,
-		events: make([]Event, 64), // 默认64个事件
+		fd:        fd,
+		events:    make([]Event, 64), // 默认64个事件
+		rawEvents: make([]byte, 64*epollEventSize),
 	}, nil
 }
 
@@ -59,8 +69,9 @@ func NewWithSize(size int) (*Epoll, error) {
 	}
 
 	return &Epoll{
-		fd:     fd,
-		events: make([]Event, size),
+		fd:        fd,
+		events:    make([]Event, size),
+		rawEvents: make([]byte, size*epollEventSize),
 	}, nil
 }
 
@@ -104,7 +115,18 @@ func (e *Epoll) Ctl(op int, fd int, events uint32) error {
 
 // Wait 等待事件，返回就绪的事件数量
 func (e *Epoll) Wait(timeout int) (int, error) {
-	return epollWait(e.fd, e.events, timeout)
+	n, err := epollWait(e.fd, e.rawEvents, timeout)
+	if err != nil || n <= 0 {
+		return n, err
+	}
+
+	// 按内核 packed 布局(12字节/条)逐条解码
+	for i := 0; i < n; i++ {
+		rec := e.rawEvents[i*epollEventSize : (i+1)*epollEventSize]
+		e.events[i].Events = binary.NativeEndian.Uint32(rec[0:4])
+		e.events[i].Data = binary.NativeEndian.Uint64(rec[4:12])
+	}
+	return n, nil
 }
 
 // WaitWithTimeout 等待事件（毫秒超时）
@@ -238,12 +260,17 @@ func epollCreate1(flags int) (int, error) {
 }
 
 // epollCtl 控制epoll实例
+// event 按内核 packed 布局(12字节)手动打包后传入
 func epollCtl(epfd int, op int, fd int, event *Event) error {
+	var buf [epollEventSize]byte
+	binary.NativeEndian.PutUint32(buf[0:4], event.Events)
+	binary.NativeEndian.PutUint64(buf[4:12], event.Data)
+
 	_, _, errno := syscall.Syscall6(syscall.SYS_EPOLL_CTL,
 		uintptr(epfd),
 		uintptr(op),
 		uintptr(fd),
-		uintptr(unsafe.Pointer(event)),
+		uintptr(unsafe.Pointer(&buf[0])),
 		0, 0)
 	if errno != 0 {
 		return errno
@@ -252,11 +279,13 @@ func epollCtl(epfd int, op int, fd int, event *Event) error {
 }
 
 // epollWait 等待epoll事件
-func epollWait(epfd int, events []Event, timeout int) (int, error) {
+// rawEvents 为内核 packed 布局的原始缓冲区（12字节/事件），
+// 由调用方(Wait方法)解码到 Event 数组
+func epollWait(epfd int, rawEvents []byte, timeout int) (int, error) {
 	n, _, errno := syscall.Syscall6(syscall.SYS_EPOLL_WAIT,
 		uintptr(epfd),
-		uintptr(unsafe.Pointer(&events[0])),
-		uintptr(len(events)),
+		uintptr(unsafe.Pointer(&rawEvents[0])),
+		uintptr(len(rawEvents)/epollEventSize),
 		uintptr(timeout),
 		0, 0)
 	if errno != 0 {

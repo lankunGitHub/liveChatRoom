@@ -1,6 +1,7 @@
 package listener
 
 import (
+	"errors"
 	"fmt"
 	"liveChatroom/util/net/base/socket"
 	"liveChatroom/util/net/net/connection"
@@ -8,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -222,6 +224,12 @@ func (l *Listener) acceptLoop() {
 		clientSocket, remoteAddr, err := l.socket.Accept()
 		if err != nil {
 			if atomic.LoadInt32(&l.stopping) == 0 {
+				// 监听socket是非阻塞的：EAGAIN表示当前没有待处理连接，
+				// 属于正常情况，短暂退避避免100% CPU空转
+				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+					time.Sleep(time.Millisecond)
+					continue
+				}
 				atomic.AddInt64(&l.errorCount, 1)
 				l.handleError(fmt.Errorf("accept failed: %v", err))
 			}

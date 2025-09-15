@@ -6,6 +6,10 @@ import (
 	"liveChatroom/util/net/net/connection"
 	"liveChatroom/util/net/net/engine"
 	"liveChatroom/util/net/protocol"
+	// 协议实现靠init()副作用注册到全局注册表，
+	// api层是使用入口，必须显式导入否则协议检测后Get会报未注册
+	_ "liveChatroom/util/net/protocol/http"
+	_ "liveChatroom/util/net/protocol/websocket"
 	"sync"
 	"sync/atomic"
 	"time"
