@@ -3,6 +3,7 @@ package message
 import (
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"sync/atomic"
 	"time"
 )
@@ -10,8 +11,8 @@ import (
 // GlobalIDGenerator 128位全局消息ID生成器
 // ID格式: 时间戳[48bit] + 用户ID[32bit] + 房间号[32bit] + 登录ID[4bit] + 序号[6bit] + 自定义[6bit]
 type GlobalIDGenerator struct {
-	sequence      uint64 // 序列号计数器
 	lastTimestamp int64  // 上次生成的时间戳(毫秒)，用于时钟回拨检测
+	seqMask       uint64 // 当前毫秒已占用的序号位图（bit i = 序号 i 已被使用）
 }
 
 const (
@@ -43,50 +44,68 @@ type GlobalID [GlobalIDLength]byte
 
 // NewGlobalIDGenerator 创建全局ID生成器
 func NewGlobalIDGenerator() *GlobalIDGenerator {
-	return &GlobalIDGenerator{
-		sequence: 0,
-	}
+	return &GlobalIDGenerator{}
 }
 
 // GenerateGlobalID 生成128位全局消息ID
 // 处理两类边界情况：
-//  1. 时钟回拨：若当前时间小于上次生成时间，复用上次时间戳，靠序列号递增保证唯一
-//  2. 同毫秒序号耗尽：6位序号每毫秒最多64个，耗尽则自旋等待下一毫秒
+//  1. 时钟回拨：若当前时间小于上次生成时间，等待时钟追平。
+//     不能复用时间戳——序号只有6位，复用时间戳时同毫秒序号很快耗尽，
+//     并发下会产生大量重复ID
+//  2. 同毫秒序号耗尽：用位图占位分配序号，6位序号每毫秒最多64个，
+//     耗尽则自旋等待墙钟推进到下一毫秒
 func (g *GlobalIDGenerator) GenerateGlobalID(userID, roomID uint32, loginID, custom uint8) GlobalID {
 	for {
 		now := time.Now().UnixMilli()
 		last := atomic.LoadInt64(&g.lastTimestamp)
 
 		if now < last {
-			// 时钟回拨，复用上次时间戳
-			now = last
-		}
-
-		// 抢占新的毫秒时间戳
-		if now > last {
-			if atomic.CompareAndSwapInt64(&g.lastTimestamp, last, now) {
-				return g.buildID(now, userID, roomID, loginID, custom)
+			// 时钟回拨：等待时钟追平（回拨通常很短，如NTP校时）
+			wait := time.Duration(last-now) * time.Millisecond
+			if wait > time.Second {
+				wait = time.Second // 异常大回拨也最多等1秒再重试
 			}
-			// 其他协程已经更新了时间戳，重新循环
+			time.Sleep(wait)
 			continue
 		}
 
-		// 同一毫秒内：序列号递增
-		seq := atomic.AddUint64(&g.sequence, 1) & MaxSequence
-		if seq == 0 {
-			// 序列号耗尽(64个/毫秒)，自旋等待下一毫秒
-			time.Sleep(200 * time.Microsecond)
-			continue
+		if now > last {
+			// 先清空序号位图（幂等操作，即使CAS失败也无害），
+			// 再抢占新的毫秒时间戳
+			atomic.StoreUint64(&g.seqMask, 0)
+			if atomic.CompareAndSwapInt64(&g.lastTimestamp, last, now) {
+				// 抢占成功，走下面的序号分配
+			} else {
+				continue // 其他协程已推进时间戳，重新循环
+			}
 		}
 
-		return g.buildIDWithSeq(now, userID, roomID, loginID, custom, seq)
+		// 在当前毫秒内占位分配序号（64个槽位，0-63）
+		for {
+			cur := atomic.LoadInt64(&g.lastTimestamp)
+			if cur != now {
+				break // 时间戳已被推进，回到外层重新对齐
+			}
+
+			mask := atomic.LoadUint64(&g.seqMask)
+			if mask == ^uint64(0) {
+				// 本毫秒64个序号全部用尽，等待墙钟推进
+				// 注意不能等 lastTimestamp 推进——它只有新进入的
+				// 协程才能推进，若所有协程都卡在这里就会死锁
+				for time.Now().UnixMilli() <= now {
+					time.Sleep(200 * time.Microsecond)
+				}
+				break
+			}
+
+			// 取最低的空闲序号位
+			bit := ^mask & (mask + 1)
+			if atomic.CompareAndSwapUint64(&g.seqMask, mask, mask|bit) {
+				seq := uint64(bits.TrailingZeros64(bit))
+				return g.buildIDWithSeq(now, userID, roomID, loginID, custom, seq)
+			}
+		}
 	}
-}
-
-// buildID 构建全局ID（新毫秒，序列号从头开始）
-func (g *GlobalIDGenerator) buildID(now int64, userID, roomID uint32, loginID, custom uint8) GlobalID {
-	seq := atomic.AddUint64(&g.sequence, 1) & MaxSequence
-	return g.buildIDWithSeq(now, userID, roomID, loginID, custom, seq)
 }
 
 // buildIDWithSeq 按给定时间戳和序列号构建全局ID

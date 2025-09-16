@@ -6,12 +6,13 @@ import (
 )
 
 // TestGenerateGlobalIDConcurrentUniqueness 并发生成ID唯一性
-// 验证CAS抢占毫秒时间戳 + 序列号递增在并发下不产生重复ID
+// 使用相同的(user,room,login,custom)键并发压测——
+// 只有每毫秒的序号位图占位分配正确，才能保证不重复
 func TestGenerateGlobalIDConcurrentUniqueness(t *testing.T) {
 	g := NewGlobalIDGenerator()
 
 	const goroutines = 32
-	const idsPerGoroutine = 500
+	const idsPerGoroutine = 200
 
 	seen := make(map[string]bool)
 	var mu sync.Mutex
@@ -19,10 +20,11 @@ func TestGenerateGlobalIDConcurrentUniqueness(t *testing.T) {
 
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
-		go func(workerID uint8) {
+		go func() {
 			defer wg.Done()
 			for j := 0; j < idsPerGoroutine; j++ {
-				id := g.GenerateGlobalID(uint32(j+1), uint32(workerID+1), workerID, 0)
+				// 所有协程使用相同的key，任何序号分配错误都会撞出重复
+				id := g.GenerateGlobalID(1, 1, 1, 0)
 				mu.Lock()
 				key := id.String()
 				if seen[key] {
@@ -31,7 +33,7 @@ func TestGenerateGlobalIDConcurrentUniqueness(t *testing.T) {
 				seen[key] = true
 				mu.Unlock()
 			}
-		}(uint8(i))
+		}()
 	}
 
 	wg.Wait()
