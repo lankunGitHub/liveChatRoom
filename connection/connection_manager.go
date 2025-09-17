@@ -21,6 +21,9 @@ type ConnectionManager struct {
 	maxConnections    int
 	connectionTimeout time.Duration
 
+	// 连接序列号生成器（心跳等系统消息用）
+	connSeqGenerator *message.ConnSeqGenerator
+
 	// 统计信息
 	totalConnections    int64
 	activeConnections   int64
@@ -39,6 +42,7 @@ func NewConnectionManager(maxConnections int) *ConnectionManager {
 		userConns:         make(map[uint32]map[string]*ClientConnection),
 		maxConnections:    maxConnections,
 		connectionTimeout: 5 * time.Minute, // 5分钟超时
+		connSeqGenerator:  message.NewConnSeqGenerator(),
 	}
 }
 
@@ -241,7 +245,8 @@ func (cm *ConnectionManager) BroadcastHeartbeat() {
 			conn.GetUserID(),
 			uint32(conn.GetCurrentRoom()),
 			conn.GetLoginID(),
-			0, // 心跳消息不需要连接序列号
+			// ValidateEnvelope要求connection_seq_id非0，用管理器自己的序列号
+			cm.connSeqGenerator.Next(),
 			heartbeat,
 		)
 		if err != nil {

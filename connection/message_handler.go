@@ -292,7 +292,15 @@ func (mh *MessageHandler) handleCloseRoom(conn *ClientConnection, envelope *mess
 		return mh.sendCloseRoomError(conn, envelope, "Not in any room")
 	}
 
-	// 关闭房间
+	// 先向房间所有成员广播关闭通知——
+	// CloseRoom会清空成员列表，关房之后再广播就没人收得到了
+	closeNotification := &message.ChatMessage{
+		Content:     "Room has been closed by the creator",
+		MessageType: message.MessageType_MESSAGE_TYPE_TEXT,
+	}
+	mh.broadcastSystemMessage(roomID, closeNotification, nil)
+
+	// 关闭房间（清空成员）
 	if err := mh.server.roomManager.CloseRoom(roomID, userID); err != nil {
 		return mh.sendCloseRoomError(conn, envelope, err.Error())
 	}
@@ -304,13 +312,6 @@ func (mh *MessageHandler) handleCloseRoom(conn *ClientConnection, envelope *mess
 	} else {
 		mh.server.routerManager.SendMessageToRouter(routerEnvelope)
 	}
-
-	// 向房间所有成员广播关闭消息
-	closeNotification := &message.ChatMessage{
-		Content:     "Room has been closed by the creator",
-		MessageType: message.MessageType_MESSAGE_TYPE_TEXT,
-	}
-	mh.broadcastSystemMessage(roomID, closeNotification, nil)
 
 	// 发送成功响应
 	ack := &message.CloseRoomAck{

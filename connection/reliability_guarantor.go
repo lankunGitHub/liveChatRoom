@@ -499,25 +499,26 @@ func (rg *ReliabilityGuarantor) cleanup() {
 	now := time.Now()
 	maxAge := rg.config.PendingMessageTTL
 
-	rg.pendingMutex.Lock()
-	defer rg.pendingMutex.Unlock()
-
+	// 收集过期key后统一经removePendingMessage移除，
+	// 保证房间FIFO队列同步清理，避免残留key造成错位确认
+	rg.pendingMutex.RLock()
 	expiredKeys := make([]string, 0)
 	for key, pending := range rg.pendingMessages {
 		if now.Sub(pending.sentTime) > maxAge {
-			// 停止定时器
+			expiredKeys = append(expiredKeys, key)
+		}
+	}
+	rg.pendingMutex.RUnlock()
+
+	for _, key := range expiredKeys {
+		pending := rg.removePendingMessage(key)
+		if pending != nil {
 			pending.mutex.Lock()
 			if pending.timer != nil {
 				pending.timer.Stop()
 			}
 			pending.mutex.Unlock()
-
-			expiredKeys = append(expiredKeys, key)
 		}
-	}
-
-	for _, key := range expiredKeys {
-		delete(rg.pendingMessages, key)
 	}
 
 	if len(expiredKeys) > 0 {
