@@ -197,15 +197,19 @@ func (rrm *RouterReliabilityManager) handleMessageTimeout(messageKey string) {
 		return // 消息已被处理
 	}
 
+	// 锁内只做状态变更，动作放到锁外执行：
+	// attemptNodeSwitch/attemptFetchConfirmation 的失败路径会调用
+	// handleMessageFailure，其内部也要取 pending.mutex，
+	// 若这里持有锁再调用会死锁
 	pending.mutex.Lock()
-	defer pending.mutex.Unlock()
-
 	pending.retries++
+	retries := pending.retries
+	pending.mutex.Unlock()
 	atomic.AddInt64(&rrm.totalRetries, 1)
 
-	if pending.retries <= rrm.config.MaxRetries {
+	if retries <= rrm.config.MaxRetries {
 		// 重传消息
-		log.Printf("Retrying message %s (attempt %d/%d)", messageKey, pending.retries, rrm.config.MaxRetries)
+		log.Printf("Retrying message %s (attempt %d/%d)", messageKey, retries, rrm.config.MaxRetries)
 
 		var err error
 		if pending.messageType == "node" && pending.targetNode != nil {
@@ -216,22 +220,24 @@ func (rrm *RouterReliabilityManager) handleMessageTimeout(messageKey string) {
 
 		if err != nil {
 			log.Printf("Retry failed for message %s: %v", messageKey, err)
-			// 如果重传失败，尝试切换节点
-			rrm.attemptNodeSwitch(messageKey, pending)
+			// 重传失败，尝试切换节点
+			if !rrm.attemptNodeSwitch(messageKey, pending) {
+				rrm.attemptFetchConfirmation(messageKey, pending)
+			}
 		} else {
 			// 重传成功，重新设置定时器
-			if pending.timer != nil {
-				pending.timer.Stop()
-			}
-
 			timeout := rrm.config.MessageTimeout
 			if pending.messageType == "center" {
 				timeout = rrm.config.MessagePersistTimeout
 			}
-
+			pending.mutex.Lock()
+			if pending.timer != nil {
+				pending.timer.Stop()
+			}
 			pending.timer = time.AfterFunc(timeout, func() {
 				rrm.handleMessageTimeout(messageKey)
 			})
+			pending.mutex.Unlock()
 		}
 	} else {
 		// 重传次数用尽，尝试fetch确认
@@ -241,7 +247,8 @@ func (rrm *RouterReliabilityManager) handleMessageTimeout(messageKey string) {
 }
 
 // attemptNodeSwitch 尝试切换节点
-func (rrm *RouterReliabilityManager) attemptNodeSwitch(messageKey string, pending *PendingRouterMessage) {
+// 返回true表示切换成功并已重发
+func (rrm *RouterReliabilityManager) attemptNodeSwitch(messageKey string, pending *PendingRouterMessage) bool {
 	if pending.messageType == "node" {
 		// 切换到其他连接节点
 		nodes := rrm.server.nodeManager.GetHealthyConnectionNodes()
@@ -252,14 +259,15 @@ func (rrm *RouterReliabilityManager) attemptNodeSwitch(messageKey string, pendin
 
 				// 重新发送
 				if err := node.SendSync(pending.data); err == nil {
-					// 重新设置定时器
+					pending.mutex.Lock()
 					if pending.timer != nil {
 						pending.timer.Stop()
 					}
 					pending.timer = time.AfterFunc(rrm.config.MessageTimeout, func() {
 						rrm.handleMessageTimeout(messageKey)
 					})
-					return
+					pending.mutex.Unlock()
+					return true
 				}
 			}
 		}
@@ -273,22 +281,21 @@ func (rrm *RouterReliabilityManager) attemptNodeSwitch(messageKey string, pendin
 
 				// 重新发送
 				if err := center.SendSync(pending.data); err == nil {
-					// 重新设置定时器
+					pending.mutex.Lock()
 					if pending.timer != nil {
 						pending.timer.Stop()
 					}
 					pending.timer = time.AfterFunc(rrm.config.MessagePersistTimeout, func() {
 						rrm.handleMessageTimeout(messageKey)
 					})
-					return
+					pending.mutex.Unlock()
+					return true
 				}
 			}
 		}
 	}
 
-	// 无法切换节点，直接尝试fetch
-	log.Printf("Failed to switch node for message %s, attempting fetch", messageKey)
-	rrm.attemptFetchConfirmation(messageKey, pending)
+	return false
 }
 
 // attemptFetchConfirmation 尝试通过fetch确认消息状态
@@ -327,9 +334,14 @@ func (rrm *RouterReliabilityManager) attemptFetchConfirmation(messageKey string,
 	}
 
 	// 设置fetch超时
+	pending.mutex.Lock()
+	if pending.timer != nil {
+		pending.timer.Stop()
+	}
 	pending.timer = time.AfterFunc(rrm.config.FetchTimeout, func() {
 		rrm.handleFetchTimeout(messageKey)
 	})
+	pending.mutex.Unlock()
 
 	log.Printf("Fetch request sent for message %s", messageKey)
 }

@@ -6,6 +6,7 @@ import (
 	"liveChatroom/message"
 	"liveChatroom/util/net/api"
 	"liveChatroom/util/net/net/connection"
+	"liveChatroom/util/net/protocol"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -119,6 +120,20 @@ func (nm *NodeManager) RegisterConnectionNode(nodeID string, conn *connection.Co
 	return nodeConn
 }
 
+// FindByConnection 按底层连接对象反查注册的节点
+// 供事件处理器把网络层连接映射回业务节点对象
+func (nm *NodeManager) FindByConnection(conn *connection.Connection) *NodeConnection {
+	nm.connMutex.RLock()
+	defer nm.connMutex.RUnlock()
+
+	for _, node := range nm.connectionNodes {
+		if node.GetConnection() == conn {
+			return node
+		}
+	}
+	return nil
+}
+
 // UnregisterConnectionNode 注销连接节点
 func (nm *NodeManager) UnregisterConnectionNode(nodeID string) error {
 	nm.connMutex.Lock()
@@ -207,10 +222,24 @@ func (nm *NodeManager) connectToMessageCenter(addr string) error {
 	nm.centerMutex.Lock()
 	defer nm.centerMutex.Unlock()
 
-	// 检查是否已连接
-	if _, exists := nm.messageCenters[addr]; exists {
-		return nil
+	// 检查是否已连接：已存在且健康则跳过；
+	// 存在但已断开/不健康的，关掉旧对象后重建
+	if existing, exists := nm.messageCenters[addr]; exists {
+		if existing.IsConnected() && existing.IsHealthy() {
+			return nil
+		}
+		log.Printf("Message center %s is stale, reconnecting", addr)
+		existing.Close()
+		delete(nm.messageCenters, addr)
+		if oldClient, ok := nm.centerClients[addr]; ok {
+			oldClient.Disconnect()
+			delete(nm.centerClients, addr)
+		}
+		atomic.AddInt64(&nm.activeMessageCenters, -1)
 	}
+
+	// 先创建业务连接封装，再以其为事件处理器创建客户端
+	centerConn := NewMessageCenterConnection(addr, nil)
 
 	// 创建客户端配置
 	clientConfig := &api.ClientConfig{
@@ -227,22 +256,23 @@ func (nm *NodeManager) connectToMessageCenter(addr string) error {
 		HeartbeatTimeout:  10 * time.Second,
 	}
 
-	// 创建客户端
-	centerClient, err := api.NewClient(clientConfig, nil) // 简化实现，不设置事件处理器
+	// 创建客户端（必须提供事件处理器，nil会直接失败）
+	handler := &MessageCenterClientHandler{
+		nodeManager: nm,
+		center:      centerConn,
+	}
+	centerClient, err := api.NewClient(clientConfig, handler)
 	if err != nil {
 		return fmt.Errorf("failed to create message center client: %v", err)
 	}
 
 	// 建立连接
-	err = centerClient.Connect(addr)
-	if err != nil {
-		centerClient.Disconnect()
+	if err := centerClient.Connect(addr); err != nil {
 		return fmt.Errorf("failed to connect to message center %s: %v", addr, err)
 	}
 
-	// 创建消息中心连接
-	centerConn := NewMessageCenterConnection(addr, centerClient.GetConnection())
 	centerConn.SetStatus(NodeStatusHealthy)
+	centerConn.UpdateHeartbeat()
 
 	// 保存连接和客户端
 	nm.messageCenters[addr] = centerConn
@@ -253,6 +283,69 @@ func (nm *NodeManager) connectToMessageCenter(addr string) error {
 
 	log.Printf("Connected to message center: %s", addr)
 	return nil
+}
+
+// MessageCenterClientHandler 消息中心客户端事件处理器 - 实现 api.ClientEventHandler
+type MessageCenterClientHandler struct {
+	nodeManager *NodeManager
+	center      *MessageCenterConnection
+}
+
+func (h *MessageCenterClientHandler) OnConnected(client *api.Client) {
+	h.center.SetConnection(client.GetConnection())
+	h.center.SetStatus(NodeStatusHealthy)
+	h.center.UpdateHeartbeat()
+}
+
+func (h *MessageCenterClientHandler) OnDisconnected(client *api.Client, err error) {
+	h.center.SetConnection(nil)
+	h.center.SetStatus(NodeStatusDisconnected)
+	if err != nil {
+		log.Printf("Disconnected from message center %s: %v", h.center.GetID(), err)
+	}
+}
+
+func (h *MessageCenterClientHandler) OnReconnected(client *api.Client, attempt int) {
+	h.center.SetConnection(client.GetConnection())
+	h.center.SetStatus(NodeStatusHealthy)
+	h.center.UpdateHeartbeat()
+}
+
+func (h *MessageCenterClientHandler) OnMessageReceived(client *api.Client, msg protocol.Message) error {
+	data := msg.GetPayload()
+
+	// 解析信封
+	envelope, err := h.nodeManager.codec.Deserialize(data)
+	if err != nil {
+		return fmt.Errorf("failed to deserialize message center response: %v", err)
+	}
+
+	// fetch响应/ACK交给可靠性管理器处理
+	router := h.nodeManager.router
+	if router != nil && router.reliabilityManager != nil {
+		switch envelope.Message.(type) {
+		case *message.MessageEnvelope_MessageFetchResponse,
+			*message.MessageEnvelope_RoomMessageFetchResponse:
+			router.reliabilityManager.HandleFetchResponse(envelope)
+		default:
+			router.reliabilityManager.HandleACK(envelope)
+		}
+	}
+
+	h.center.UpdateActivity()
+	return nil
+}
+
+func (h *MessageCenterClientHandler) OnHeartbeatSent(client *api.Client) {
+	h.center.UpdateHeartbeat()
+}
+
+func (h *MessageCenterClientHandler) OnHeartbeatReceived(client *api.Client) {
+	h.center.UpdateHeartbeat()
+}
+
+func (h *MessageCenterClientHandler) OnError(client *api.Client, err error) {
+	log.Printf("Message center client error for %s: %v", h.center.GetID(), err)
 }
 
 // GetMessageCenter 获取消息中心连接

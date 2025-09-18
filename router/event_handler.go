@@ -27,7 +27,7 @@ func (h *RouterEventHandler) OnConnectionAccepted(conn *connection.Connection) {
 	connID := h.generateConnectionID(conn)
 
 	// 判断连接类型（连接节点还是消息中心）
-	// 这里简化处理，实际应该通过握手协议确定
+	// 消息中心由路由节点主动连接，这里入站的都视为连接节点
 	nodeType := h.determineNodeType(conn)
 
 	if nodeType == NodeTypeConnection {
@@ -42,49 +42,42 @@ func (h *RouterEventHandler) OnConnectionAccepted(conn *connection.Connection) {
 
 		log.Printf("Connection node connected: %s from %s", connID, conn.RemoteAddr())
 	} else {
-		// 这里暂时不处理消息中心的主动连接
-		// 消息中心通常由路由节点主动连接
 		log.Printf("Unknown connection type from %s", conn.RemoteAddr())
 	}
 }
 
 // OnConnectionClosed 连接断开事件
 func (h *RouterEventHandler) OnConnectionClosed(conn *connection.Connection, err error) {
-	connID := h.getConnectionID(conn)
-	if connID == "" {
+	// 按连接对象反查注册的节点
+	node := h.server.nodeManager.FindByConnection(conn)
+	if node == nil {
 		return
 	}
 
-	// 直接更新统计信息
+	// 注销节点，清理表与计数（此前只减统计不删表，死节点永久残留）
+	_ = h.server.nodeManager.UnregisterConnectionNode(node.GetID())
+
 	atomic.AddInt64(&h.server.stats.ActiveConnections, -1)
 	atomic.AddInt64(&h.server.stats.ConnectionNodes, -1)
 
 	if err != nil {
-		log.Printf("Node disconnected with error: %s - %v", connID, err)
+		log.Printf("Node disconnected with error: %s - %v", node.GetID(), err)
 	} else {
-		log.Printf("Node disconnected: %s", connID)
+		log.Printf("Node disconnected: %s", node.GetID())
 	}
 }
 
 // OnMessageReceived 接收消息事件
 func (h *RouterEventHandler) OnMessageReceived(conn *connection.Connection, msg protocol.Message) error {
-	connID := h.getConnectionID(conn)
-	if connID == "" {
+	// 按连接对象反查注册的节点
+	node := h.server.nodeManager.FindByConnection(conn)
+	if node == nil {
 		log.Printf("Received data from unknown connection")
 		return fmt.Errorf("unknown connection")
 	}
 
-	// 获取消息数据
-	data := msg.GetPayload()
-
-	// 简化实现：直接反序列化和路由消息
-	// 实际实现需要根据具体的消息路由逻辑
-	log.Printf("Received message from %s: %d bytes", connID, len(data))
-
-	// 更新统计信息
-	atomic.AddInt64(&h.server.stats.MessagesReceived, 1)
-
-	return nil
+	// 交给统一的消息处理入口（此前此处只打日志，整条路由链路不可达）
+	return h.server.HandleMessage(node, msg.GetPayload())
 }
 
 // OnError 错误事件
@@ -102,33 +95,18 @@ func (h *RouterEventHandler) generateConnectionID(conn *connection.Connection) s
 	return fmt.Sprintf("router_%s_%d", remoteAddr, timestamp)
 }
 
-// getConnectionID 获取连接ID
-func (h *RouterEventHandler) getConnectionID(conn *connection.Connection) string {
-	// 简化实现：使用连接地址作为ID
-	// 实际应该维护一个连接到ID的映射
-	return fmt.Sprintf("node_%s", conn.RemoteAddr())
-}
-
 // determineNodeType 确定节点类型
 func (h *RouterEventHandler) determineNodeType(conn *connection.Connection) NodeType {
-	// 简化实现：根据连接来源判断
-	// 实际应该通过握手协议确定
-	remoteAddr := conn.RemoteAddr()
-
-	// 这里简化处理，认为所有连接都是连接节点
-	// 实际实现中应该通过握手协议或配置来确定
-	log.Printf("Determining node type for %s, assuming connection node", remoteAddr)
+	// 消息中心由路由节点主动连接（NodeManager维护客户端连接），
+	// 因此所有入站连接都视为连接节点
 	return NodeTypeConnection
 }
 
 // parseRemoteAddr 解析远程地址
 func (h *RouterEventHandler) parseRemoteAddr(addr string) (string, int) {
 	// 简化实现，解析 host:port
-	// 实际实现需要更健壮的地址解析
 	host := addr
 	port := 0
-
-	// 这里简化处理
 	return host, port
 }
 

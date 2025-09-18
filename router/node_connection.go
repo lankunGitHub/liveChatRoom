@@ -121,7 +121,16 @@ func (nc *NodeConnection) GetNodeType() NodeType {
 
 // GetConnection 获取底层连接
 func (nc *NodeConnection) GetConnection() *connection.Connection {
+	nc.mutex.RLock()
+	defer nc.mutex.RUnlock()
 	return nc.connection
+}
+
+// SetConnection 设置底层连接（由客户端事件处理器在连接建立/断开时更新）
+func (nc *NodeConnection) SetConnection(conn *connection.Connection) {
+	nc.mutex.Lock()
+	defer nc.mutex.Unlock()
+	nc.connection = conn
 }
 
 // GetHost 获取主机地址
