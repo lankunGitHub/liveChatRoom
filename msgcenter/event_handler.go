@@ -5,6 +5,7 @@ import (
 	"liveChatroom/util/net/net/connection"
 	"liveChatroom/util/net/protocol"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -12,23 +13,30 @@ import (
 // MessageCenterEventHandler 消息中心事件处理器 - 实现 api.EventHandler 接口
 type MessageCenterEventHandler struct {
 	server *MessageCenterServer
+
+	// 底层连接 -> 路由连接封装的映射
+	routerConns map[*connection.Connection]*RouterConnection
+	mutex       sync.RWMutex
 }
 
 // NewMessageCenterEventHandler 创建消息中心事件处理器
 func NewMessageCenterEventHandler(server *MessageCenterServer) *MessageCenterEventHandler {
 	return &MessageCenterEventHandler{
-		server: server,
+		server:      server,
+		routerConns: make(map[*connection.Connection]*RouterConnection),
 	}
 }
 
 // OnConnectionAccepted 连接建立事件
 func (h *MessageCenterEventHandler) OnConnectionAccepted(conn *connection.Connection) {
-	// 生成连接ID
+	// 生成连接ID并创建路由连接封装（此前RouterConnection从不被构造，
+	// 导致响应发送路径空指针）
 	connID := h.generateConnectionID(conn)
+	routerConn := NewRouterConnection(connID, conn)
 
-	// 简化实现：直接记录连接信息
-	// 实际实现需要维护路由连接映射
-	log.Printf("New router connection from %s", conn.RemoteAddr())
+	h.mutex.Lock()
+	h.routerConns[conn] = routerConn
+	h.mutex.Unlock()
 
 	// 更新统计信息
 	atomic.AddInt64(&h.server.stats.TotalConnections, 1)
@@ -40,44 +48,44 @@ func (h *MessageCenterEventHandler) OnConnectionAccepted(conn *connection.Connec
 
 // OnConnectionClosed 连接断开事件
 func (h *MessageCenterEventHandler) OnConnectionClosed(conn *connection.Connection, err error) {
-	connID := h.getConnectionID(conn)
-	if connID == "" {
+	h.mutex.Lock()
+	routerConn, exists := h.routerConns[conn]
+	if exists {
+		delete(h.routerConns, conn)
+	}
+	h.mutex.Unlock()
+
+	if !exists {
 		return
 	}
 
-	// 处理路由连接断开
-	h.handleRouterDisconnect(connID)
+	// 关闭路由连接封装
+	routerConn.Close()
 
 	// 更新统计信息
 	atomic.AddInt64(&h.server.stats.ActiveConnections, -1)
 	atomic.AddInt64(&h.server.stats.RouterConnections, -1)
 
 	if err != nil {
-		log.Printf("Router disconnected with error: %s - %v", connID, err)
+		log.Printf("Router disconnected with error: %s - %v", routerConn.GetID(), err)
 	} else {
-		log.Printf("Router disconnected: %s", connID)
+		log.Printf("Router disconnected: %s", routerConn.GetID())
 	}
 }
 
 // OnMessageReceived 接收消息事件
 func (h *MessageCenterEventHandler) OnMessageReceived(conn *connection.Connection, msg protocol.Message) error {
-	connID := h.getConnectionID(conn)
-	if connID == "" {
+	h.mutex.RLock()
+	routerConn := h.routerConns[conn]
+	h.mutex.RUnlock()
+
+	if routerConn == nil {
 		log.Printf("Received data from unknown connection")
 		return fmt.Errorf("unknown connection")
 	}
 
-	// 获取消息数据
-	data := msg.GetPayload()
-
-	// 简化实现：直接记录消息接收
-	// 实际实现需要根据具体的消息处理逻辑
-	log.Printf("Received message from %s: %d bytes", connID, len(data))
-
-	// 更新统计信息
-	atomic.AddInt64(&h.server.stats.MessagesReceived, 1)
-
-	return nil
+	// 交给统一的消息处理入口（此前此处只打日志，整条持久化链路不可达）
+	return h.server.HandleMessage(routerConn, msg.GetPayload())
 }
 
 // OnError 错误事件
@@ -95,27 +103,10 @@ func (h *MessageCenterEventHandler) generateConnectionID(conn *connection.Connec
 	return fmt.Sprintf("msgcenter_%s_%d", remoteAddr, timestamp)
 }
 
-// getConnectionID 获取连接ID
-func (h *MessageCenterEventHandler) getConnectionID(conn *connection.Connection) string {
-	// 简化实现：使用连接地址作为ID
-	// 实际应该维护一个连接到ID的映射
-	return fmt.Sprintf("router_%s", conn.RemoteAddr())
-}
-
 // parseRemoteAddr 解析远程地址
 func (h *MessageCenterEventHandler) parseRemoteAddr(addr string) (string, int) {
 	// 简化实现，解析 host:port
-	// 实际实现需要更健壮的地址解析
 	host := addr
 	port := 0
-
-	// 这里简化处理
 	return host, port
-}
-
-// handleRouterDisconnect 处理路由连接断开
-func (h *MessageCenterEventHandler) handleRouterDisconnect(connID string) {
-	// 简化实现：记录断开日志
-	// 实际实现需要清理路由信息和相关资源
-	log.Printf("Cleaned up resources for disconnected router: %s", connID)
 }

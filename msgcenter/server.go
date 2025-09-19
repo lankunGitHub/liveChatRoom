@@ -439,17 +439,18 @@ func (mcs *MessageCenterServer) Stop() error {
 
 	log.Printf("Stopping MessageCenterServer %s...", mcs.nodeID)
 
+	// 先停Kafka消费者：它要把剩余批次落库并提交offset，
+	// 依赖数据库上下文存活，必须在cancel之前完成
+	if mcs.kafkaConsumer != nil {
+		mcs.kafkaConsumer.Stop()
+	}
+
 	// 取消上下文
 	mcs.cancel()
 
 	// 停止网络服务器
 	if mcs.server != nil {
 		mcs.server.Stop()
-	}
-
-	// 停止Kafka消费者
-	if mcs.kafkaConsumer != nil {
-		mcs.kafkaConsumer.Stop()
 	}
 
 	// 关闭数据库连接

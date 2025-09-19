@@ -14,14 +14,16 @@ import (
 )
 
 // KafkaConsumer Kafka消费者 - 消费消息队列中的消息并批量落库
-// 配合INSERT IGNORE和message_id唯一索引，重复消费/重放是幂等的
+// 投递语义为 at-least-once：先落库成功、后提交offset，
+// 落库失败的消息不提交，进程重启后由Kafka重放恢复；
+// 配合 INSERT IGNORE 和 message_id 唯一索引，重复消费/重放是幂等的
 type KafkaConsumer struct {
 	reader *kafka.Reader
 	db     *DatabaseManager
 	config *MessageCenterConfig
 
-	// 批量落库缓冲
-	batch      []*PersistMessage
+	// 批量落库缓冲（同时保留kafka消息以便落库成功后提交offset）
+	batch      []*batchEntry
 	batchMutex sync.Mutex
 
 	// 统计信息
@@ -35,12 +37,18 @@ type KafkaConsumer struct {
 	wg     sync.WaitGroup
 }
 
+// batchEntry 批量缓冲条目
+type batchEntry struct {
+	persist *PersistMessage
+	kafka   kafka.Message
+}
+
 // NewKafkaConsumer 创建Kafka消费者
 func NewKafkaConsumer(db *DatabaseManager, config *MessageCenterConfig) *KafkaConsumer {
 	return &KafkaConsumer{
 		db:     db,
 		config: config,
-		batch:  make([]*PersistMessage, 0, config.BatchInsertSize),
+		batch:  make([]*batchEntry, 0, config.BatchInsertSize),
 	}
 }
 
@@ -78,7 +86,7 @@ func (kc *KafkaConsumer) Stop() {
 	}
 	kc.wg.Wait()
 
-	// 落库剩余批次
+	// 落库剩余批次并提交offset
 	kc.flushBatch()
 
 	if kc.reader != nil {
@@ -115,17 +123,18 @@ func (kc *KafkaConsumer) consumeLoop() {
 
 		// 解析消息
 		persistMsg := kc.parseKafkaMessage(m.Value)
-		if persistMsg != nil {
-			kc.addToBatch(persistMsg)
-			atomic.AddInt64(&kc.messagesConsumed, 1)
+		if persistMsg == nil {
+			// 解析失败的消息直接跳过（无法重放也没有重试价值）
+			commitCtx, commitCancel := context.WithTimeout(kc.ctx, 5*time.Second)
+			if err := kc.reader.CommitMessages(commitCtx, m); err != nil {
+				log.Printf("Failed to commit kafka offset: %v", err)
+			}
+			commitCancel()
+			continue
 		}
 
-		// 提交offset（落库失败的消息依赖重放恢复，message_id唯一索引保证幂等）
-		commitCtx, commitCancel := context.WithTimeout(kc.ctx, 5*time.Second)
-		if err := kc.reader.CommitMessages(commitCtx, m); err != nil {
-			log.Printf("Failed to commit kafka offset: %v", err)
-		}
-		commitCancel()
+		atomic.AddInt64(&kc.messagesConsumed, 1)
+		kc.addToBatch(&batchEntry{persist: persistMsg, kafka: m})
 	}
 }
 
@@ -164,16 +173,16 @@ func (kc *KafkaConsumer) parseKafkaMessage(data []byte) *PersistMessage {
 }
 
 // addToBatch 添加到批量落库缓冲
-func (kc *KafkaConsumer) addToBatch(persistMsg *PersistMessage) {
+func (kc *KafkaConsumer) addToBatch(entry *batchEntry) {
 	kc.batchMutex.Lock()
 	defer kc.batchMutex.Unlock()
 
-	kc.batch = append(kc.batch, persistMsg)
+	kc.batch = append(kc.batch, entry)
 
 	// 达到批量大小立即落库
 	if len(kc.batch) >= kc.config.BatchInsertSize {
 		batch := kc.batch
-		kc.batch = make([]*PersistMessage, 0, kc.config.BatchInsertSize)
+		kc.batch = make([]*batchEntry, 0, kc.config.BatchInsertSize)
 		go kc.persistBatch(batch)
 	}
 }
@@ -200,7 +209,7 @@ func (kc *KafkaConsumer) batchFlushLoop() {
 	}
 }
 
-// flushBatch 落库当前批次
+// flushBatch 落库当前批次并提交offset
 func (kc *KafkaConsumer) flushBatch() {
 	kc.batchMutex.Lock()
 	if len(kc.batch) == 0 {
@@ -208,18 +217,33 @@ func (kc *KafkaConsumer) flushBatch() {
 		return
 	}
 	batch := kc.batch
-	kc.batch = make([]*PersistMessage, 0, kc.config.BatchInsertSize)
+	kc.batch = make([]*batchEntry, 0, kc.config.BatchInsertSize)
 	kc.batchMutex.Unlock()
 
 	kc.persistBatch(batch)
 }
 
-// persistBatch 执行批量落库
-func (kc *KafkaConsumer) persistBatch(batch []*PersistMessage) {
-	if err := kc.db.BatchInsertMessages(batch); err != nil {
+// persistBatch 执行批量落库，成功后提交offset
+// 落库失败时不提交offset，消息靠重启重放恢复（at-least-once）
+func (kc *KafkaConsumer) persistBatch(batch []*batchEntry) {
+	persistMsgs := make([]*PersistMessage, len(batch))
+	for i, entry := range batch {
+		persistMsgs[i] = entry.persist
+	}
+
+	if err := kc.db.BatchInsertMessages(persistMsgs); err != nil {
 		log.Printf("Failed to persist kafka message batch: %v", err)
 		atomic.AddInt64(&kc.messagesFailed, int64(len(batch)))
 		return
+	}
+
+	// 落库成功，提交本批所有消息的offset
+	for _, entry := range batch {
+		commitCtx, commitCancel := context.WithTimeout(kc.ctx, 5*time.Second)
+		if err := kc.reader.CommitMessages(commitCtx, entry.kafka); err != nil {
+			log.Printf("Failed to commit kafka offset: %v", err)
+		}
+		commitCancel()
 	}
 
 	atomic.AddInt64(&kc.messagesPersisted, int64(len(batch)))
@@ -227,10 +251,14 @@ func (kc *KafkaConsumer) persistBatch(batch []*PersistMessage) {
 
 // GetStats 获取消费者统计信息
 func (kc *KafkaConsumer) GetStats() map[string]interface{} {
+	kc.batchMutex.Lock()
+	pending := len(kc.batch)
+	kc.batchMutex.Unlock()
+
 	return map[string]interface{}{
 		"messages_consumed":  atomic.LoadInt64(&kc.messagesConsumed),
 		"messages_persisted": atomic.LoadInt64(&kc.messagesPersisted),
 		"messages_failed":    atomic.LoadInt64(&kc.messagesFailed),
-		"pending_batch":      len(kc.batch),
+		"pending_batch":      pending,
 	}
 }
