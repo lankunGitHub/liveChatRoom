@@ -24,7 +24,11 @@ type ReliabilityManager struct {
 	// 服务器返回的ACK只带room_id，不携带原始消息ID，
 	// 因此按房间维护发送顺序，ACK到达时确认队首消息
 	roomPendingQueues map[uint32][]string
-	queueMutex        sync.RWMutex
+	// 房间ID分配请求队列（AllocateRoomIdAck不携带任何关联信息，只能FIFO确认）
+	allocateQueue []string
+	// 房间历史拉取请求（RoomMessageFetchResponse按room匹配确认）
+	roomFetchPending map[uint32]string
+	queueMutex       sync.RWMutex
 
 	// 统计信息
 	totalRetries int64
@@ -48,6 +52,7 @@ func NewReliabilityManager(client *LiveChatClient, config *ClientConfig) *Reliab
 		config:            config,
 		pendingMessages:   make(map[string]*PendingMessage),
 		roomPendingQueues: make(map[uint32][]string),
+		roomFetchPending:  make(map[uint32]string),
 	}
 }
 
@@ -58,6 +63,15 @@ func (rm *ReliabilityManager) Start(ctx context.Context) {
 
 // SendMessage 发送消息（带可靠性保证）
 func (rm *ReliabilityManager) SendMessage(envelope *message.MessageEnvelope, data []byte) error {
+	// 心跳不进入可靠性追踪：心跳是周期性的，
+	// 丢一个心跳还有下一个，走重传反而制造大量噪音
+	if _, ok := envelope.Message.(*message.MessageEnvelope_Heartbeat); ok {
+		if err := rm.sendToActiveConnection(data); err != nil {
+			return fmt.Errorf("failed to send heartbeat: %v", err)
+		}
+		return nil
+	}
+
 	// 生成消息键
 	messageKey := rm.getMessageKey(envelope)
 
@@ -74,12 +88,8 @@ func (rm *ReliabilityManager) SendMessage(envelope *message.MessageEnvelope, dat
 	rm.pendingMessages[messageKey] = pending
 	rm.pendingMutex.Unlock()
 
-	// 房间级消息加入FIFO队列，用于ACK匹配
-	if roomID, ok := rm.getEnvelopeRoom(envelope); ok {
-		rm.queueMutex.Lock()
-		rm.roomPendingQueues[roomID] = append(rm.roomPendingQueues[roomID], messageKey)
-		rm.queueMutex.Unlock()
-	}
+	// 按消息类型加入对应的匹配队列
+	rm.enqueueForACKMatching(envelope, messageKey)
 
 	// 发送消息
 	if err := rm.sendToActiveConnection(data); err != nil {
@@ -106,6 +116,33 @@ func (rm *ReliabilityManager) SendMessage(envelope *message.MessageEnvelope, dat
 	return nil
 }
 
+// enqueueForACKMatching 按消息类型加入对应的ACK匹配队列
+func (rm *ReliabilityManager) enqueueForACKMatching(envelope *message.MessageEnvelope, messageKey string) {
+	switch envelope.Message.(type) {
+	case *message.MessageEnvelope_AllocateRoomId:
+		rm.queueMutex.Lock()
+		rm.allocateQueue = append(rm.allocateQueue, messageKey)
+		rm.queueMutex.Unlock()
+
+	case *message.MessageEnvelope_RoomMessageFetchRequest:
+		// 拉取请求按房间记录（同一房间的多次拉取，后者覆盖前者，
+		// 拉取是可重放的查询，最坏情况只是多一次拉取）
+		if globalID, err := message.FromBytes(envelope.MessageId); err == nil {
+			rm.queueMutex.Lock()
+			rm.roomFetchPending[globalID.ExtractRoomID()] = messageKey
+			rm.queueMutex.Unlock()
+		}
+
+	default:
+		// 房间级消息加入FIFO队列
+		if roomID, ok := rm.getEnvelopeRoom(envelope); ok {
+			rm.queueMutex.Lock()
+			rm.roomPendingQueues[roomID] = append(rm.roomPendingQueues[roomID], messageKey)
+			rm.queueMutex.Unlock()
+		}
+	}
+}
+
 // HandleACK 处理ACK确认消息
 func (rm *ReliabilityManager) HandleACK(envelope *message.MessageEnvelope) bool {
 	// 检查是否是ACK消息
@@ -116,6 +153,12 @@ func (rm *ReliabilityManager) HandleACK(envelope *message.MessageEnvelope) bool 
 	// fetch响应按原消息ID精确匹配，单独处理
 	if fetchResp, ok := envelope.Message.(*message.MessageEnvelope_MessageFetchResponse); ok {
 		rm.handleMessageFetchResponse(fetchResp.MessageFetchResponse)
+		return true
+	}
+
+	// 房间历史拉取响应：确认该房间的拉取请求pending
+	if roomResp, ok := envelope.Message.(*message.MessageEnvelope_RoomMessageFetchResponse); ok {
+		rm.handleRoomFetchResponse(roomResp.RoomMessageFetchResponse)
 		return true
 	}
 
@@ -132,6 +175,24 @@ func (rm *ReliabilityManager) HandleACK(envelope *message.MessageEnvelope) bool 
 	}
 
 	return true
+}
+
+// handleRoomFetchResponse 处理房间历史拉取响应
+// 响应到达即证明服务器已处理请求，确认该房间的拉取pending
+func (rm *ReliabilityManager) handleRoomFetchResponse(response *message.RoomMessageFetchResponse) {
+	rm.queueMutex.Lock()
+	messageKey := rm.roomFetchPending[uint32(response.RoomId)]
+	delete(rm.roomFetchPending, uint32(response.RoomId))
+	rm.queueMutex.Unlock()
+
+	if messageKey == "" {
+		return // 无待确认的拉取请求（可能已超时清理）
+	}
+
+	pending := rm.removePendingMessage(messageKey)
+	if pending != nil {
+		rm.confirmMessage(pending, messageKey)
+	}
 }
 
 // confirmMessage 确认单条消息送达
@@ -166,6 +227,7 @@ func (rm *ReliabilityManager) handleMessageTimeout(messageKey string) {
 
 	pending.retries++
 	atomic.AddInt64(&rm.totalRetries, 1)
+	atomic.AddInt64(&rm.client.stats.TotalRetries, 1)
 
 	if pending.retries <= rm.config.MaxRetries {
 		// 重传消息
@@ -198,6 +260,7 @@ func (rm *ReliabilityManager) handleMessageTimeout(messageKey string) {
 // attemptFetchConfirmation 尝试通过fetch确认消息状态
 func (rm *ReliabilityManager) attemptFetchConfirmation(messageKey string, pending *PendingMessage) {
 	atomic.AddInt64(&rm.totalFetches, 1)
+	atomic.AddInt64(&rm.client.stats.TotalFetches, 1)
 
 	// 尝试连接到其他节点进行fetch
 	if err := rm.client.switchToNextAvailableConnection(); err != nil {
@@ -330,13 +393,10 @@ func (rm *ReliabilityManager) getEnvelopeRoom(envelope *message.MessageEnvelope)
 	switch msg := envelope.Message.(type) {
 	case *message.MessageEnvelope_CreateRoom:
 		return uint32(msg.CreateRoom.RoomId), true
-	case *message.MessageEnvelope_JoinRoom:
-		// JoinRoom消息本身不带房间ID，房间ID在MessageId中
-		if globalID, err := message.FromBytes(envelope.MessageId); err == nil {
-			return globalID.ExtractRoomID(), true
-		}
-		return 0, false
-	case *message.MessageEnvelope_ChatMessage:
+	case *message.MessageEnvelope_JoinRoom, *message.MessageEnvelope_LeaveRoom,
+		*message.MessageEnvelope_CloseRoom, *message.MessageEnvelope_ChatMessage:
+		// 这些消息本身不带房间ID（或发送时已写入客户端roomID），
+		// 房间ID从MessageId中提取
 		if globalID, err := message.FromBytes(envelope.MessageId); err == nil {
 			return globalID.ExtractRoomID(), true
 		}
@@ -348,6 +408,18 @@ func (rm *ReliabilityManager) getEnvelopeRoom(envelope *message.MessageEnvelope)
 
 // getOriginalMessageKey 从ACK消息中提取原始消息键
 func (rm *ReliabilityManager) getOriginalMessageKey(envelope *message.MessageEnvelope) string {
+	// 房间ID分配ACK不携带任何关联信息，只能FIFO确认
+	if _, ok := envelope.Message.(*message.MessageEnvelope_AllocateRoomIdAck); ok {
+		rm.queueMutex.Lock()
+		defer rm.queueMutex.Unlock()
+		if len(rm.allocateQueue) == 0 {
+			return ""
+		}
+		key := rm.allocateQueue[0]
+		rm.allocateQueue = rm.allocateQueue[1:]
+		return key
+	}
+
 	// 房间级ACK只带room_id，不携带原始消息ID
 	// 由于同一连接上的消息是顺序发送、顺序确认的，
 	// 使用房间FIFO队列队首作为被确认的原始消息
@@ -357,6 +429,10 @@ func (rm *ReliabilityManager) getOriginalMessageKey(envelope *message.MessageEnv
 		roomID = uint32(ack.CreateRoomAck.RoomId)
 	case *message.MessageEnvelope_JoinRoomAck:
 		roomID = uint32(ack.JoinRoomAck.RoomId)
+	case *message.MessageEnvelope_LeaveRoomAck:
+		roomID = uint32(ack.LeaveRoomAck.RoomId)
+	case *message.MessageEnvelope_CloseRoomAck:
+		roomID = uint32(ack.CloseRoomAck.RoomId)
 	case *message.MessageEnvelope_ChatMessageAck:
 		roomID = uint32(ack.ChatMessageAck.RoomId)
 	case *message.MessageEnvelope_HeartbeatAck:
@@ -388,10 +464,10 @@ func (rm *ReliabilityManager) isACKMessage(envelope *message.MessageEnvelope) bo
 		*message.MessageEnvelope_CloseRoomAck,
 		*message.MessageEnvelope_ChatMessageAck,
 		*message.MessageEnvelope_MessageFetchResponse,
+		*message.MessageEnvelope_RoomMessageFetchResponse,
 		*message.MessageEnvelope_HeartbeatAck:
 		return true
 	default:
-		// RoomMessageFetchResponse是历史消息数据，不是确认，交给消息处理器
 		return false
 	}
 }
@@ -405,8 +481,32 @@ func (rm *ReliabilityManager) removePendingMessage(messageKey string) *PendingMe
 	}
 	rm.pendingMutex.Unlock()
 
-	if pending != nil {
-		// 同时从房间FIFO队列中移除
+	if pending == nil {
+		return nil
+	}
+
+	// 从各匹配队列中清理该key，防止残留造成错位确认
+	switch pending.envelope.Message.(type) {
+	case *message.MessageEnvelope_AllocateRoomId:
+		rm.queueMutex.Lock()
+		for i, key := range rm.allocateQueue {
+			if key == messageKey {
+				rm.allocateQueue = append(rm.allocateQueue[:i], rm.allocateQueue[i+1:]...)
+				break
+			}
+		}
+		rm.queueMutex.Unlock()
+
+	case *message.MessageEnvelope_RoomMessageFetchRequest:
+		if globalID, err := message.FromBytes(pending.envelope.MessageId); err == nil {
+			rm.queueMutex.Lock()
+			if rm.roomFetchPending[globalID.ExtractRoomID()] == messageKey {
+				delete(rm.roomFetchPending, globalID.ExtractRoomID())
+			}
+			rm.queueMutex.Unlock()
+		}
+
+	default:
 		if roomID, ok := rm.getEnvelopeRoom(pending.envelope); ok {
 			rm.queueMutex.Lock()
 			queue := rm.roomPendingQueues[roomID]
@@ -448,20 +548,20 @@ func (rm *ReliabilityManager) cleanup() {
 	now := time.Now()
 	maxAge := 5 * time.Minute // 最大存活时间
 
-	rm.pendingMutex.Lock()
-	defer rm.pendingMutex.Unlock()
-
+	// 收集过期key后统一经removePendingMessage移除，
+	// 保证各匹配队列同步清理，避免残留key造成错位确认
+	rm.pendingMutex.RLock()
+	var expired []string
 	for key, pending := range rm.pendingMessages {
 		if now.Sub(pending.sentTime) > maxAge {
-			pending.mutex.Lock()
-			if pending.timer != nil {
-				pending.timer.Stop()
-			}
-			pending.mutex.Unlock()
-
-			delete(rm.pendingMessages, key)
-			log.Printf("Cleaned up expired pending message: %s", key)
+			expired = append(expired, key)
 		}
+	}
+	rm.pendingMutex.RUnlock()
+
+	for _, key := range expired {
+		rm.removePendingMessage(key)
+		log.Printf("Cleaned up expired pending message: %s", key)
 	}
 }
 
